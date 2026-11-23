@@ -20,6 +20,8 @@ pub mod safe_buffer;
 mod vector_of_any;
 pub use vector_of_any::VectorOfAny;
 mod r#struct;
+#[cfg(test)]
+mod test_util;
 pub use crate::r#struct::Struct;
 pub use crate::reflection_generated::reflection;
 pub use crate::reflection_verifier::verify_with_options;

@@ -496,121 +496,7 @@ fn verify_union<'a, 'b, 'c>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reflection_generated::reflection::{
-        Enum, EnumArgs, EnumVal, EnumValArgs, FieldArgs, ObjectArgs, SchemaArgs, Type, TypeArgs,
-    };
-    use flatbuffers::{FlatBufferBuilder, WIPOffset};
-
-    struct TestField {
-        name: &'static str,
-        base_type: BaseType,
-        index: i32,
-        offset: u16,
-    }
-
-    fn field(name: &'static str, base_type: BaseType, index: i32, offset: u16) -> TestField {
-        TestField {
-            name,
-            base_type,
-            index,
-            offset,
-        }
-    }
-
-    /// Builds a schema of tables with `objects` (sorted by name, fields sorted by name) and, if
-    /// `string_union` is set, a union enum `U` whose only member is a string.
-    fn build_schema(objects: &[(&str, Vec<TestField>)], string_union: bool) -> Vec<u8> {
-        let mut builder = FlatBufferBuilder::new();
-        let mut object_offsets = Vec::new();
-        for (name, fields) in objects {
-            let mut field_offsets = Vec::new();
-            for f in fields {
-                let field_name = builder.create_string(f.name);
-                let type_ = Type::create(
-                    &mut builder,
-                    &TypeArgs {
-                        base_type: f.base_type,
-                        index: f.index,
-                        ..Default::default()
-                    },
-                );
-                field_offsets.push(Field::create(
-                    &mut builder,
-                    &FieldArgs {
-                        name: Some(field_name),
-                        type_: Some(type_),
-                        offset: f.offset,
-                        ..Default::default()
-                    },
-                ));
-            }
-            let name = builder.create_string(name);
-            let fields = builder.create_vector(&field_offsets);
-            object_offsets.push(Object::create(
-                &mut builder,
-                &ObjectArgs {
-                    name: Some(name),
-                    fields: Some(fields),
-                    ..Default::default()
-                },
-            ));
-        }
-        let mut enum_offsets = Vec::new();
-        if string_union {
-            let mut values = Vec::new();
-            for (name, base_type, value) in [("NONE", BaseType::None, 0), ("Str", BaseType::String, 1)]
-            {
-                let name = builder.create_string(name);
-                let union_type = Type::create(
-                    &mut builder,
-                    &TypeArgs {
-                        base_type,
-                        ..Default::default()
-                    },
-                );
-                values.push(EnumVal::create(
-                    &mut builder,
-                    &EnumValArgs {
-                        name: Some(name),
-                        value,
-                        union_type: Some(union_type),
-                        ..Default::default()
-                    },
-                ));
-            }
-            let name = builder.create_string("U");
-            let values = builder.create_vector(&values);
-            let underlying_type = Type::create(
-                &mut builder,
-                &TypeArgs {
-                    base_type: BaseType::UType,
-                    ..Default::default()
-                },
-            );
-            enum_offsets.push(Enum::create(
-                &mut builder,
-                &EnumArgs {
-                    name: Some(name),
-                    values: Some(values),
-                    is_union: true,
-                    underlying_type: Some(underlying_type),
-                    ..Default::default()
-                },
-            ));
-        }
-        let objects = builder.create_vector(&object_offsets);
-        let enums = builder.create_vector::<WIPOffset<Enum>>(&enum_offsets);
-        let schema = Schema::create(
-            &mut builder,
-            &SchemaArgs {
-                objects: Some(objects),
-                enums: Some(enums),
-                ..Default::default()
-            },
-        );
-        builder.finish_minimal(schema);
-        builder.finished_data().to_vec()
-    }
+    use crate::test_util::{build_schema, field, TestObject};
 
     fn le_u16s(values: &[u16]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -631,15 +517,15 @@ mod tests {
     fn test_table_shared_by_fields_of_different_types_is_verified_as_each_type() {
         let schema = build_schema(
             &[
-                ("A", vec![field("x", BaseType::UByte, -1, 4)]),
-                (
+                TestObject::new_table("A", vec![field("x", BaseType::UByte, -1, 4)]),
+                TestObject::new_table(
                     "B",
                     vec![
                         field("q", BaseType::ULong, -1, 4),
                         field("y", BaseType::UByte, -1, 6),
                     ],
                 ),
-                (
+                TestObject::new_table(
                     "Root",
                     vec![
                         field("a", BaseType::Obj, 0, 4),
@@ -669,8 +555,8 @@ mod tests {
     fn test_table_at_union_string_position_is_verified() {
         let schema = build_schema(
             &[
-                ("B", vec![field("q", BaseType::ULong, -1, 4)]),
-                (
+                TestObject::new_table("B", vec![field("q", BaseType::ULong, -1, 4)]),
+                TestObject::new_table(
                     "Root",
                     vec![
                         field("a", BaseType::Union, 0, 6),
@@ -702,8 +588,8 @@ mod tests {
     fn test_table_shared_by_fields_of_same_type_is_accepted() {
         let schema = build_schema(
             &[
-                ("A", vec![field("x", BaseType::UByte, -1, 4)]),
-                (
+                TestObject::new_table("A", vec![field("x", BaseType::UByte, -1, 4)]),
+                TestObject::new_table(
                     "Root",
                     vec![
                         field("a", BaseType::Obj, 0, 4),
