@@ -9,39 +9,64 @@ use flatbuffers::{FlatBufferBuilder, WIPOffset};
 pub struct TestField {
     name: &'static str,
     base_type: BaseType,
+    element: BaseType,
     index: i32,
     offset: u16,
+    fixed_length: u16,
 }
 
 pub fn field(name: &'static str, base_type: BaseType, index: i32, offset: u16) -> TestField {
     TestField {
         name,
         base_type,
+        element: BaseType::None,
         index,
         offset,
+        fixed_length: 0,
+    }
+}
+
+pub fn vector_field(name: &'static str, element: BaseType, index: i32, offset: u16) -> TestField {
+    TestField {
+        element,
+        ..field(name, BaseType::Vector, index, offset)
+    }
+}
+
+pub fn array_field(
+    name: &'static str,
+    element: BaseType,
+    index: i32,
+    offset: u16,
+    fixed_length: u16,
+) -> TestField {
+    TestField {
+        element,
+        fixed_length,
+        ..field(name, BaseType::Array, index, offset)
     }
 }
 
 pub struct TestObject {
-    name: &'static str,
+    name: String,
     is_struct: bool,
     bytesize: i32,
     fields: Vec<TestField>,
 }
 
 impl TestObject {
-    pub fn new_table(name: &'static str, fields: Vec<TestField>) -> Self {
+    pub fn new_table(name: impl Into<String>, fields: Vec<TestField>) -> Self {
         Self {
-            name,
+            name: name.into(),
             is_struct: false,
             bytesize: 0,
             fields,
         }
     }
 
-    pub fn new_struct(name: &'static str, bytesize: i32, fields: Vec<TestField>) -> Self {
+    pub fn new_struct(name: impl Into<String>, bytesize: i32, fields: Vec<TestField>) -> Self {
         Self {
-            name,
+            name: name.into(),
             is_struct: true,
             bytesize,
             fields,
@@ -49,10 +74,19 @@ impl TestObject {
     }
 }
 
+/// A member of the union `U`: its name, and the base type it holds, if the schema gives one.
+pub type TestUnionValue = (&'static str, Option<BaseType>);
+
+/// The members of a union whose only member holds a string.
+pub const STRING_UNION: &[TestUnionValue] = &[
+    ("NONE", Some(BaseType::None)),
+    ("Str", Some(BaseType::String)),
+];
+
 /// Builds a schema with `objects`, which must be sorted by name, with fields sorted by name. The
-/// object named `Root`, if any, is the root table. If `string_union` is set, the schema has a union
-/// enum `U` whose only member is a string.
-pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
+/// object named `Root`, if any, is the root table. If `union_values` is not empty, the schema has
+/// a union enum `U` with those members, valued by position.
+pub fn build_schema(objects: &[TestObject], union_values: &[TestUnionValue]) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
     let mut object_offsets = Vec::new();
     let mut root_table = None;
@@ -64,7 +98,9 @@ pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
                 &mut builder,
                 &TypeArgs {
                     base_type: f.base_type,
+                    element: f.element,
                     index: f.index,
+                    fixed_length: f.fixed_length,
                     ..Default::default()
                 },
             );
@@ -78,7 +114,7 @@ pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
                 },
             ));
         }
-        let name = builder.create_string(object.name);
+        let name = builder.create_string(&object.name);
         let fields = builder.create_vector(&field_offsets);
         let offset = Object::create(
             &mut builder,
@@ -97,24 +133,25 @@ pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
         object_offsets.push(offset);
     }
     let mut enum_offsets = Vec::new();
-    if string_union {
+    if !union_values.is_empty() {
         let mut values = Vec::new();
-        for (name, base_type, value) in [("NONE", BaseType::None, 0), ("Str", BaseType::String, 1)]
-        {
+        for (value, &(name, base_type)) in (0..).zip(union_values) {
             let name = builder.create_string(name);
-            let union_type = Type::create(
-                &mut builder,
-                &TypeArgs {
-                    base_type,
-                    ..Default::default()
-                },
-            );
+            let union_type = base_type.map(|base_type| {
+                Type::create(
+                    &mut builder,
+                    &TypeArgs {
+                        base_type,
+                        ..Default::default()
+                    },
+                )
+            });
             values.push(EnumVal::create(
                 &mut builder,
                 &EnumValArgs {
                     name: Some(name),
                     value,
-                    union_type: Some(union_type),
+                    union_type,
                     ..Default::default()
                 },
             ));

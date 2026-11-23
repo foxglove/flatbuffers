@@ -561,6 +561,15 @@ pub fn get_type_size(base_type: BaseType) -> usize {
     }
 }
 
+/// Returns whether `base_type` is an integer type, counting `Bool` and `UType`.
+pub(crate) fn is_integer(base_type: BaseType) -> bool {
+    (BaseType::UType..=BaseType::ULong).contains(&base_type)
+}
+
+pub(crate) fn is_float(base_type: BaseType) -> bool {
+    matches!(base_type, BaseType::Float | BaseType::Double)
+}
+
 /// Returns the absolute field location in the buffer and [None] if the field is not populated.
 ///
 /// # Safety
