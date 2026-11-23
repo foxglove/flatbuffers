@@ -115,7 +115,13 @@ fn check_field_type<T>(field: &Field, matches: bool) -> FlatbufferResult<()> {
 }
 
 /// A type that [SafeTable::get_field_vector] can read vector elements as.
-pub trait SafeVectorElement<'a>: Follow<'a> {
+///
+/// # Safety
+///
+/// `reads` must return true only for element types whose verified encoding `Self` reads without
+/// going out of bounds: the element's inline size must be at least `size_of::<Self>()`, and any
+/// offsets `Self` follows must have been checked by the verifier.
+pub unsafe trait SafeVectorElement<'a>: Follow<'a> {
     /// Whether this type reads vector elements of type `element`. `obj` is the element's object
     /// when `element` is [BaseType::Obj].
     fn reads(element: BaseType, obj: Option<&Object>) -> bool;
@@ -124,7 +130,7 @@ pub trait SafeVectorElement<'a>: Follow<'a> {
 macro_rules! impl_safe_vector_scalar {
     ($($type:ty => $($base_type:ident)|+),+ $(,)?) => {
         $(
-            impl<'a> SafeVectorElement<'a> for $type {
+            unsafe impl<'a> SafeVectorElement<'a> for $type {
                 fn reads(element: BaseType, _obj: Option<&Object>) -> bool {
                     matches!(element, $(BaseType::$base_type)|+)
                 }
@@ -147,13 +153,13 @@ impl_safe_vector_scalar!(
     f64 => Double,
 );
 
-impl<'a> SafeVectorElement<'a> for ForwardsUOffset<&'a str> {
+unsafe impl<'a> SafeVectorElement<'a> for ForwardsUOffset<&'a str> {
     fn reads(element: BaseType, _obj: Option<&Object>) -> bool {
         element == BaseType::String
     }
 }
 
-impl<'a> SafeVectorElement<'a> for ForwardsUOffset<Table<'a>> {
+unsafe impl<'a> SafeVectorElement<'a> for ForwardsUOffset<Table<'a>> {
     fn reads(element: BaseType, obj: Option<&Object>) -> bool {
         element == BaseType::Obj && obj.is_some_and(|obj| !obj.is_struct())
     }
