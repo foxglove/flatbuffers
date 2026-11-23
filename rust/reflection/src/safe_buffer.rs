@@ -22,8 +22,8 @@ use crate::{
     get_any_field_float, get_any_field_float_in_struct, get_any_field_integer,
     get_any_field_integer_in_struct, get_any_field_string, get_any_field_string_in_struct,
     get_any_root, get_field_float, get_field_integer, get_field_string, get_field_struct,
-    get_field_struct_in_struct, get_field_table, get_field_vector, get_type_size, is_float,
-    is_integer, FlatbufferError, FlatbufferResult,
+    get_field_struct_in_struct, get_field_table, get_field_vector, get_object, get_type_size,
+    is_float, is_integer, is_scalar, FlatbufferError, FlatbufferResult,
 };
 use flatbuffers::{EndianScalar, Follow, Table, Vector, VerifierOptions};
 use num_traits::float::Float;
@@ -75,11 +75,7 @@ impl<'a> SafeBuffer<'a> {
     fn struct_type(&self, field: &Field) -> FlatbufferResult<Object<'a>> {
         let type_ = field.type_();
         if type_.base_type() == BaseType::Obj {
-            if let Some(obj) = usize::try_from(type_.index())
-                .ok()
-                .filter(|&i| i < self.schema.objects().len())
-                .map(|i| self.schema.objects().get(i))
-            {
+            if let Ok(obj) = get_object(self.schema, type_.index()) {
                 if obj.is_struct() {
                     return Ok(obj);
                 }
@@ -95,6 +91,16 @@ fn type_mismatch(data_type: &str, field_type: BaseType) -> FlatbufferError {
         data_type.to_string(),
         field_type.variant_name().unwrap_or_default().to_string(),
     )
+}
+
+/// Returns a type mismatch unless `base_type` is of a kind that `T` can read (`kind_ok`) and has
+/// `T`'s size.
+fn check_scalar<T>(base_type: BaseType, kind_ok: bool) -> FlatbufferResult<()> {
+    if kind_ok && core::mem::size_of::<T>() == get_type_size(base_type) {
+        Ok(())
+    } else {
+        Err(type_mismatch(type_name::<T>(), base_type))
+    }
 }
 
 fn find_field_by_name<'a>(obj: &Object<'a>, field_name: &str) -> Option<Field<'a>> {
@@ -122,9 +128,7 @@ impl<'a> SafeTable<'a> {
     ) -> FlatbufferResult<Option<T>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
             let base_type = field.type_().base_type();
-            if !is_integer(base_type) || core::mem::size_of::<T>() != get_type_size(base_type) {
-                return Err(type_mismatch(type_name::<T>(), base_type));
-            }
+            check_scalar::<T>(base_type, is_integer(base_type))?;
             // SAFETY: the buffer was verified during construction, and `field` holds a `T`.
             Ok(
                 unsafe {
@@ -146,9 +150,7 @@ impl<'a> SafeTable<'a> {
     ) -> FlatbufferResult<Option<T>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
             let base_type = field.type_().base_type();
-            if !is_float(base_type) || core::mem::size_of::<T>() != get_type_size(base_type) {
-                return Err(type_mismatch(type_name::<T>(), base_type));
-            }
+            check_scalar::<T>(base_type, is_float(base_type))?;
             // SAFETY: the buffer was verified during construction, and `field` holds a `T`.
             Ok(unsafe { get_field_float::<T>(&Table::new(&self.safe_buf.buf, self.loc), &field) })
         } else {
@@ -220,11 +222,7 @@ impl<'a> SafeTable<'a> {
                 return Err(type_mismatch(type_name::<T>(), type_.base_type()));
             }
             let element = type_.element();
-            if !(is_integer(element) || is_float(element))
-                || core::mem::size_of::<T>() != get_type_size(element)
-            {
-                return Err(type_mismatch(type_name::<T>(), element));
-            }
+            check_scalar::<T>(element, is_scalar(element))?;
             // SAFETY: the buffer was verified during construction, `field` is a vector of scalars
             // the size of `T`, and `T` reads any bits as a valid value.
             Ok(unsafe { get_field_vector(&Table::new(&self.safe_buf.buf, self.loc), &field) })
@@ -239,10 +237,8 @@ impl<'a> SafeTable<'a> {
     pub fn get_field_table(&self, field_name: &str) -> FlatbufferResult<Option<SafeTable<'a>>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
             let obj = (field.type_().base_type() == BaseType::Obj)
-                .then(|| usize::try_from(field.type_().index()).ok())
+                .then(|| get_object(self.safe_buf.schema, field.type_().index()).ok())
                 .flatten()
-                .filter(|&i| i < self.safe_buf.schema.objects().len())
-                .map(|i| self.safe_buf.schema.objects().get(i))
                 .filter(|obj| !obj.is_struct());
             let Some(obj) = obj else {
                 return Err(type_mismatch("Table", field.type_().base_type()));
@@ -388,7 +384,7 @@ impl<'a> SafeStruct<'a> {
 mod tests {
     use super::*;
     use crate::reflection_generated::reflection::root_as_schema;
-    use crate::test_util::{build_schema, field, vector_field, TestObject};
+    use crate::test_util::{build_schema, field, one_field_table, vector_field, TestObject};
     use flatbuffers::FlatBufferBuilder;
 
     /// A table `Root { f: float, s: string, v: [uint], w: [string], x: ushort }`.
@@ -425,82 +421,75 @@ mod tests {
         builder.finished_data().to_vec()
     }
 
+    /// Calls `f` with the root table of [mixed_fields_buffer].
+    fn with_mixed_root(f: impl FnOnce(&SafeTable)) {
+        let schema_data = mixed_fields_schema();
+        let schema = root_as_schema(&schema_data).unwrap();
+        let buffer = mixed_fields_buffer();
+        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
+        f(&safe_buffer.get_root());
+    }
+
     fn mismatch(data_type: &str, field_type: &str) -> FlatbufferError {
         FlatbufferError::FieldTypeMismatch(data_type.to_string(), field_type.to_string())
     }
 
     #[test]
     fn test_get_field_integer_rejects_other_types_and_sizes() {
-        let schema_data = mixed_fields_schema();
-        let schema = root_as_schema(&schema_data).unwrap();
-        let buffer = mixed_fields_buffer();
-        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
-        let root = safe_buffer.get_root();
-
-        assert_eq!(root.get_field_integer::<u16>("x"), Ok(Some(3)));
-        assert_eq!(
-            root.get_field_integer::<i64>("x"),
-            Err(mismatch("i64", "UShort"))
-        );
-        assert_eq!(
-            root.get_field_integer::<u32>("f"),
-            Err(mismatch("u32", "Float"))
-        );
+        with_mixed_root(|root| {
+            assert_eq!(root.get_field_integer::<u16>("x"), Ok(Some(3)));
+            assert_eq!(
+                root.get_field_integer::<i64>("x"),
+                Err(mismatch("i64", "UShort"))
+            );
+            assert_eq!(
+                root.get_field_integer::<u32>("f"),
+                Err(mismatch("u32", "Float"))
+            );
+        });
     }
 
     #[test]
     fn test_get_field_float_rejects_other_types_and_sizes() {
-        let schema_data = mixed_fields_schema();
-        let schema = root_as_schema(&schema_data).unwrap();
-        let buffer = mixed_fields_buffer();
-        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
-        let root = safe_buffer.get_root();
-
-        assert_eq!(root.get_field_float::<f32>("f"), Ok(Some(1.5)));
-        assert_eq!(
-            root.get_field_float::<f64>("f"),
-            Err(mismatch("f64", "Float"))
-        );
-        assert_eq!(
-            root.get_field_float::<f32>("v"),
-            Err(mismatch("f32", "Vector"))
-        );
+        with_mixed_root(|root| {
+            assert_eq!(root.get_field_float::<f32>("f"), Ok(Some(1.5)));
+            assert_eq!(
+                root.get_field_float::<f64>("f"),
+                Err(mismatch("f64", "Float"))
+            );
+            assert_eq!(
+                root.get_field_float::<f32>("v"),
+                Err(mismatch("f32", "Vector"))
+            );
+        });
     }
 
     #[test]
     fn test_get_field_string_rejects_other_types() {
-        let schema_data = mixed_fields_schema();
-        let schema = root_as_schema(&schema_data).unwrap();
-        let buffer = mixed_fields_buffer();
-        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
-        let root = safe_buffer.get_root();
-
-        assert_eq!(root.get_field_string("s"), Ok(Some("text")));
-        assert_eq!(root.get_field_string("f"), Err(mismatch("String", "Float")));
+        with_mixed_root(|root| {
+            assert_eq!(root.get_field_string("s"), Ok(Some("text")));
+            assert_eq!(root.get_field_string("f"), Err(mismatch("String", "Float")));
+        });
     }
 
     #[test]
     fn test_get_field_vector_rejects_other_types_and_element_types() {
-        let schema_data = mixed_fields_schema();
-        let schema = root_as_schema(&schema_data).unwrap();
-        let buffer = mixed_fields_buffer();
-        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
-        let root = safe_buffer.get_root();
-
-        let v = root.get_field_vector::<u32>("v").unwrap();
-        assert_eq!(v.iter().collect::<Vec<_>>(), [7]);
-        assert_eq!(
-            root.get_field_vector::<u16>("v").unwrap_err(),
-            mismatch("u16", "UInt")
-        );
-        assert_eq!(
-            root.get_field_vector::<u32>("w").unwrap_err(),
-            mismatch("u32", "String")
-        );
-        assert_eq!(
-            root.get_field_vector::<u8>("f").unwrap_err(),
-            mismatch("u8", "Float")
-        );
+        with_mixed_root(|root| {
+            let v = root.get_field_vector::<u32>("v").unwrap();
+            assert_eq!(v.iter().collect::<Vec<_>>(), [7]);
+            assert_eq!(
+                root.get_field_vector::<u16>("v").unwrap_err(),
+                mismatch("u16", "UInt")
+            );
+            assert_eq!(
+                root.get_field_vector::<u32>("w").unwrap_err(),
+                mismatch("u32", "String")
+            );
+            assert_eq!(
+                root.get_field_vector::<u8>("f").unwrap_err(),
+                mismatch("u8", "Float")
+            );
+        });
     }
 
     /// A table `Root { p: P }`, where struct `P { c: C, z: ubyte }` holds struct `C { x: uint }`
@@ -524,16 +513,7 @@ mod tests {
     }
 
     fn nested_struct_buffer() -> Vec<u8> {
-        let mut buffer = Vec::new();
-        buffer.extend(12u32.to_le_bytes()); // root table offset
-        for x in [6u16, 12, 4] {
-            buffer.extend(x.to_le_bytes()); // root vtable
-        }
-        buffer.extend([0, 0]); // padding
-        buffer.extend(8i32.to_le_bytes()); // root table to vtable
-        buffer.extend(7u32.to_le_bytes()); // `p.c.x`
-        buffer.extend([9, 0, 0, 0]); // `p.z` and padding
-        buffer
+        one_field_table(&[7, 0, 0, 0, 9, 0, 0, 0]) // `p.c.x`, then `p.z` and padding
     }
 
     #[test]

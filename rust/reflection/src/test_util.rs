@@ -1,4 +1,4 @@
-//! Builds reflection schemas for tests.
+//! Builds reflection schemas and buffers for tests.
 
 use crate::reflection_generated::reflection::{
     BaseType, Enum, EnumArgs, EnumVal, EnumValArgs, Field, FieldArgs, Object, ObjectArgs, Schema,
@@ -189,4 +189,20 @@ pub fn build_schema(objects: &[TestObject], union_values: &[TestUnionValue]) -> 
     );
     builder.finish_minimal(schema);
     builder.finished_data().to_vec()
+}
+
+pub fn le_u16s(values: &[u16]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// A root table whose only field, at vtable offset 4 and buffer position 16, holds `field`.
+pub fn one_field_table(field: &[u8]) -> Vec<u8> {
+    let table_size = u16::try_from(4 + field.len()).unwrap();
+    let mut buffer = Vec::new();
+    buffer.extend(12u32.to_le_bytes()); // root table offset
+    buffer.extend(le_u16s(&[6, table_size, 4])); // root vtable
+    buffer.extend([0, 0]); // padding
+    buffer.extend(8i32.to_le_bytes()); // root table to vtable
+    buffer.extend(field);
+    buffer
 }

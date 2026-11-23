@@ -31,7 +31,7 @@ use flatbuffers::{
     emplace_scalar, read_scalar, EndianScalar, Follow, ForwardsUOffset, InvalidFlatbuffer,
     SOffsetT, Table, UOffsetT, VOffsetT, Vector, SIZE_SOFFSET, SIZE_UOFFSET,
 };
-use reflection_generated::reflection::{BaseType, Field, Object, Schema};
+use reflection_generated::reflection::{BaseType, Enum, Field, Object, Schema};
 
 use core::mem::size_of;
 use num_traits::float::Float;
@@ -570,6 +570,22 @@ pub(crate) fn is_float(base_type: BaseType) -> bool {
     matches!(base_type, BaseType::Float | BaseType::Double)
 }
 
+/// Returns the object at `index` in `schema.objects()`, or `InvalidSchema` if there is none.
+pub(crate) fn get_object<'a>(schema: &Schema<'a>, index: i32) -> FlatbufferResult<Object<'a>> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| schema.objects().iter().nth(i))
+        .ok_or(FlatbufferError::InvalidSchema)
+}
+
+/// Returns the enum at `index` in `schema.enums()`, or `InvalidSchema` if there is none.
+pub(crate) fn get_enum<'a>(schema: &Schema<'a>, index: i32) -> FlatbufferResult<Enum<'a>> {
+    usize::try_from(index)
+        .ok()
+        .and_then(|i| schema.enums().iter().nth(i))
+        .ok_or(FlatbufferError::InvalidSchema)
+}
+
 /// Returns the absolute field location in the buffer and [None] if the field is not populated.
 ///
 /// # Safety
@@ -920,7 +936,7 @@ fn set_any_value_float(
     ));
 }
 
-fn is_scalar(base_type: BaseType) -> bool {
+pub(crate) fn is_scalar(base_type: BaseType) -> bool {
     return base_type <= BaseType::Double;
 }
 
