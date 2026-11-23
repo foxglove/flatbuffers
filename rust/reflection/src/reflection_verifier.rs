@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-use crate::reflection_generated::reflection::{BaseType, Field, Object, Schema};
+use crate::reflection_generated::reflection::{BaseType, Enum, Field, Object, Schema, Type};
 use crate::{FlatbufferError, FlatbufferResult};
 use flatbuffers::{
     ForwardsUOffset, InvalidFlatbuffer, TableVerifier, UOffsetT, Vector, Verifiable, Verifier,
@@ -376,8 +376,6 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
         end: enum_vector_start.saturating_add(enum_vector_size.try_into()?),
     };
 
-    let enum_values = child_enum.values();
-
     for (enum_pos, union_offset_pos) in
         enum_vector_range.zip(value_vector_range.step_by(SIZE_UOFFSET))
     {
@@ -395,14 +393,7 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
             continue;
         }
 
-        let enum_value: usize = enum_value.into();
-        let enum_type = if enum_value < enum_values.len() {
-            enum_values.get(enum_value).union_type().expect(
-                "Schema verification should have checked that every union enum value has a type",
-            )
-        } else {
-            return Err(FlatbufferError::InvalidUnionEnum);
-        };
+        let enum_type = union_member_type(&child_enum, enum_value)?;
         let union_pos =
             union_offset_pos.saturating_add(verifier.get_uoffset(union_offset_pos)?.try_into()?);
         verifier.in_buffer::<u8>(union_pos)?;
@@ -433,6 +424,17 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
     Ok(table_verifier)
 }
 
+/// Returns the type of the member of `union_enum` whose value is `tag`.
+fn union_member_type<'a>(union_enum: &Enum<'a>, tag: u8) -> FlatbufferResult<Type<'a>> {
+    union_enum
+        .values()
+        .lookup_by_key(i64::from(tag), |value, tag| {
+            value.key_compare_with_value(*tag)
+        })
+        .and_then(|value| value.union_type())
+        .ok_or(FlatbufferError::InvalidUnionEnum)
+}
+
 fn verify_union<'a, 'b, 'c>(
     mut table_verifier: TableVerifier<'a, 'b, 'c>,
     field: &Field,
@@ -449,11 +451,7 @@ fn verify_union<'a, 'b, 'c>(
     let enum_offset = field.offset() - u16::try_from(SIZE_VOFFSET)?;
     if let Some(enum_pos) = table_verifier.deref(enum_offset)? {
         let enum_value = table_verifier.verifier().get_u8(enum_pos)?;
-        let enum_type = union_enum
-            .values()
-            .get(enum_value.into())
-            .union_type()
-            .ok_or(FlatbufferError::InvalidUnionEnum)?;
+        let enum_type = union_member_type(&union_enum, enum_value)?;
 
         match enum_type.base_type() {
             BaseType::String => <&str>::run_verifier(table_verifier.verifier(), union_pos)?,
@@ -496,7 +494,7 @@ fn verify_union<'a, 'b, 'c>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_util::{build_schema, field, TestObject};
+    use crate::test_util::{build_schema, field, vector_field, TestObject, TestUnion};
 
     fn le_u16s(values: &[u16]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
@@ -533,7 +531,7 @@ mod tests {
                     ],
                 ),
             ],
-            false,
+            &[],
         );
 
         // `Root.a` and `Root.b` both point at one table, whose only data byte is the last byte of
@@ -565,7 +563,7 @@ mod tests {
                     ],
                 ),
             ],
-            true,
+            &[TestUnion::string()],
         );
 
         // Union `Root.a` holds a string, and `Root.t` points at the same position, which is not a
@@ -597,7 +595,7 @@ mod tests {
                     ],
                 ),
             ],
-            false,
+            &[],
         );
 
         let mut buffer = Vec::new();
@@ -611,5 +609,118 @@ mod tests {
         buffer.push(1);
 
         verify(&buffer, &schema).unwrap();
+    }
+
+    /// Tables `A { x: uint }` and `B { v: [ubyte] }`, a table `Root` with `root_fields`, and a union
+    /// `U` with `members`, where `A` is object 0 and `B` is object 1.
+    fn union_schema(
+        root_fields: Vec<crate::test_util::TestField>,
+        members: Vec<(&'static str, BaseType, i32, i64)>,
+    ) -> Vec<u8> {
+        build_schema(
+            &[
+                TestObject::new_table("A", vec![field("x", BaseType::UInt, -1, 4)]),
+                TestObject::new_table("B", vec![vector_field("v", BaseType::UByte, -1, 4)]),
+                TestObject::new_table("Root", root_fields),
+            ],
+            &[TestUnion { name: "U", members }],
+        )
+    }
+
+    /// `Root { u_type: U; u: U }`.
+    fn single_union_schema(members: Vec<(&'static str, BaseType, i32, i64)>) -> Vec<u8> {
+        union_schema(
+            vec![
+                field("u", BaseType::Union, 0, 6),
+                field("u_type", BaseType::UType, 0, 4),
+            ],
+            members,
+        )
+    }
+
+    /// A `Root` whose union field has tag `tag` and points at a table that is a valid `A` with
+    /// `x = 4`. As a `B`, its vector would start past the end of the buffer.
+    fn single_union_buffer(tag: u8) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[8, 12, 4, 8])); // root vtable
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend([tag, 0, 0, 0]); // `u_type` and padding
+        buffer.extend(12u32.to_le_bytes()); // `u`
+        buffer.extend(le_u16s(&[6, 8, 4])); // member table vtable
+        buffer.extend([0, 0]); // padding
+        buffer.extend(8i32.to_le_bytes()); // member table to vtable
+        buffer.extend(4u32.to_le_bytes()); // `A.x`
+        buffer
+    }
+
+    /// Union members `NONE = 0`, `B = 2` and `A = 3`, so that `B`'s value is `A`'s position.
+    fn shuffled_members() -> Vec<(&'static str, BaseType, i32, i64)> {
+        vec![
+            ("NONE", BaseType::None, -1, 0),
+            ("B", BaseType::Obj, 1, 2),
+            ("A", BaseType::Obj, 0, 3),
+        ]
+    }
+
+    #[test]
+    fn test_union_member_is_verified_as_the_type_of_its_value() {
+        let schema = single_union_schema(shuffled_members());
+        // Tag 2 is `B`, so the member table is too short.
+        assert!(verify(&single_union_buffer(2), &schema).is_err());
+        // Tag 3 is `A`, which the member table is.
+        verify(&single_union_buffer(3), &schema).unwrap();
+    }
+
+    #[test]
+    fn test_union_with_non_contiguous_values_is_accepted() {
+        let schema = single_union_schema(vec![
+            ("NONE", BaseType::None, -1, 0),
+            ("A", BaseType::Obj, 0, 5),
+        ]);
+        verify(&single_union_buffer(5), &schema).unwrap();
+    }
+
+    #[test]
+    fn test_union_tag_without_member_is_rejected() {
+        let schema = single_union_schema(shuffled_members());
+        assert!(matches!(
+            verify(&single_union_buffer(9), &schema),
+            Err(FlatbufferError::InvalidUnionEnum)
+        ));
+    }
+
+    #[test]
+    fn test_vector_of_unions_member_is_verified_as_the_type_of_its_value() {
+        let schema = union_schema(
+            vec![
+                vector_field("u", BaseType::Union, 0, 6),
+                vector_field("u_type", BaseType::UType, 0, 4),
+            ],
+            shuffled_members(),
+        );
+        let buffer = |tag: u8| {
+            let mut buffer = Vec::new();
+            buffer.extend(12u32.to_le_bytes()); // root table offset
+            buffer.extend(le_u16s(&[8, 12, 4, 8])); // root vtable
+            buffer.extend(8i32.to_le_bytes()); // root table to vtable
+            buffer.extend(8u32.to_le_bytes()); // `u_type`
+            buffer.extend(12u32.to_le_bytes()); // `u`
+            buffer.extend(1u32.to_le_bytes()); // `u_type` length
+            buffer.extend([tag, 0, 0, 0]); // `u_type[0]` and padding
+            buffer.extend(1u32.to_le_bytes()); // `u` length
+            buffer.extend(12u32.to_le_bytes()); // `u[0]`
+            buffer.extend(le_u16s(&[6, 8, 4])); // member table vtable
+            buffer.extend([0, 0]); // padding
+            buffer.extend(8i32.to_le_bytes()); // member table to vtable
+            buffer.extend(4u32.to_le_bytes()); // `A.x`
+            buffer
+        };
+        assert!(verify(&buffer(2), &schema).is_err());
+        verify(&buffer(3), &schema).unwrap();
+        assert!(matches!(
+            verify(&buffer(9), &schema),
+            Err(FlatbufferError::InvalidUnionEnum)
+        ));
     }
 }

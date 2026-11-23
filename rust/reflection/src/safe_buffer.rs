@@ -387,7 +387,7 @@ mod tests {
                 ),
                 TestObject::new_table("Root", vec![field("p", BaseType::Obj, 1, 4)]),
             ],
-            false,
+            &[],
         )
     }
 
