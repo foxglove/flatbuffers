@@ -41,7 +41,7 @@ pub fn verify_with_options(
         if let Ok(table_pos) = verifier.get_uoffset(0) {
             // Inserts -1 as object index for root table
             buf_loc_to_obj_idx.insert(table_pos.try_into()?, -1);
-            let mut verified = HashSet::new();
+            let mut verified = Verified::default();
             return verify_table(
                 &mut verifier,
                 &table_object,
@@ -55,19 +55,24 @@ pub fn verify_with_options(
     Err(FlatbufferError::InvalidSchema)
 }
 
-/// Tables already verified, by buffer position and the location of their type in the schema.
-type VerifiedTables = HashSet<(usize, usize)>;
+#[derive(Default)]
+struct Verified {
+    /// Tables already verified, by buffer position and the location of their type in the schema.
+    tables: HashSet<(usize, usize)>,
+    /// Structs whose layout has been verified, by the location of their type in the schema.
+    struct_layouts: HashSet<usize>,
+}
 
 fn verify_table(
     verifier: &mut Verifier,
     table_object: &Object,
     table_pos: usize,
     schema: &Schema,
-    verified: &mut VerifiedTables,
+    verified: &mut Verified,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<()> {
     let key = (table_pos, table_object._tab.loc());
-    if verified.contains(&key) {
+    if verified.tables.contains(&key) {
         return Ok(());
     }
 
@@ -130,8 +135,6 @@ fn verify_table(
                             field_pos,
                             schema,
                             verified,
-                            buf_loc_to_obj_idx,
-                            0,
                         )?
                     } else {
                         let field_value = table_verifier.verifier().get_uoffset(field_pos)?;
@@ -175,7 +178,7 @@ fn verify_table(
     }
 
     table_verifier.finish();
-    verified.insert(key);
+    verified.tables.insert(key);
     Ok(())
 }
 
@@ -187,24 +190,35 @@ fn verify_struct(
     struct_object: &Object,
     struct_pos: usize,
     schema: &Schema,
-    verified: &mut VerifiedTables,
-    buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
+    verified: &mut Verified,
+) -> FlatbufferResult<()> {
+    verify_struct_layout(struct_object, schema, verified, 0)?;
+    verifier.range_in_buffer(struct_pos, struct_object.bytesize().try_into()?)?;
+    Ok(())
+}
+
+/// Checks that each of the struct's fields is a scalar, a struct, or a fixed array of either, and
+/// ends within the struct. Nested structs are inline, so a struct whose layout passes is in the
+/// buffer whenever its `bytesize` bytes are.
+fn verify_struct_layout(
+    struct_object: &Object,
+    schema: &Schema,
+    verified: &mut Verified,
     depth: usize,
 ) -> FlatbufferResult<()> {
+    let key = struct_object._tab.loc();
+    if verified.struct_layouts.contains(&key) {
+        return Ok(());
+    }
     if depth > MAX_STRUCT_DEPTH {
         return Err(FlatbufferError::InvalidSchema);
     }
-    let key = (struct_pos, struct_object._tab.loc());
-    if verified.contains(&key) {
-        return Ok(());
-    }
     let bytesize: usize = struct_object.bytesize().try_into()?;
-    verifier.range_in_buffer(struct_pos, bytesize)?;
     for field in &struct_object.fields() {
         let type_ = field.type_();
         // Returns the size of a struct field or array element of type `base_type`, and the
         // struct it holds, if any.
-        let element = |base_type| -> FlatbufferResult<(usize, Option<(i32, Object)>)> {
+        let element = |base_type| -> FlatbufferResult<(usize, Option<Object>)> {
             match base_type {
                 BaseType::Bool
                 | BaseType::Byte
@@ -222,8 +236,7 @@ fn verify_struct(
                     if !child_obj.is_struct() {
                         return Err(FlatbufferError::InvalidSchema);
                     }
-                    let size = child_obj.bytesize().try_into()?;
-                    Ok((size, Some((type_.index(), child_obj))))
+                    Ok((child_obj.bytesize().try_into()?, Some(child_obj)))
                 }
                 _ => Err(FlatbufferError::InvalidSchema),
             }
@@ -234,37 +247,21 @@ fn verify_struct(
                 let size = element_size
                     .checked_mul(type_.fixed_length().into())
                     .ok_or(FlatbufferError::InvalidSchema)?;
-                // Array elements share their type's layout, so verifying the first element's
-                // nested structs verifies every element's.
-                let child = child.filter(|_| type_.fixed_length() > 0);
                 (size, child)
             }
             base_type => element(base_type)?,
         };
-        let offset: usize = field.offset().into();
-        if offset
+        if usize::from(field.offset())
             .checked_add(size)
             .map_or(true, |field_end| field_end > bytesize)
         {
             return Err(FlatbufferError::InvalidSchema);
         }
-        if let Some((obj_idx, child_obj)) = child {
-            let field_pos = struct_pos.saturating_add(offset);
-            if type_.base_type() == BaseType::Obj {
-                buf_loc_to_obj_idx.insert(field_pos, obj_idx);
-            }
-            verify_struct(
-                verifier,
-                &child_obj,
-                field_pos,
-                schema,
-                verified,
-                buf_loc_to_obj_idx,
-                depth + 1,
-            )?;
+        if let Some(child_obj) = child {
+            verify_struct_layout(&child_obj, schema, verified, depth + 1)?;
         }
     }
-    verified.insert(key);
+    verified.struct_layouts.insert(key);
     Ok(())
 }
 
@@ -272,7 +269,7 @@ fn verify_vector<'a, 'b, 'c>(
     mut table_verifier: TableVerifier<'a, 'b, 'c>,
     field: &Field,
     schema: &Schema,
-    verified: &mut VerifiedTables,
+    verified: &mut Verified,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
     let field_name = field.name().to_owned();
@@ -317,19 +314,11 @@ fn verify_vector<'a, 'b, 'c>(
                         start: vector_start,
                         end: vector_start.saturating_add(vector_size.try_into()?),
                     };
+                    verify_struct_layout(&child_obj, schema, verified, 0)?;
                     // A struct of size 0 holds no bytes to verify.
                     let step = struct_size.max(1);
                     for struct_pos in vector_range.step_by(step) {
                         buf_loc_to_obj_idx.insert(struct_pos, child_obj_idx);
-                        verify_struct(
-                            verifier,
-                            &child_obj,
-                            struct_pos,
-                            schema,
-                            verified,
-                            buf_loc_to_obj_idx,
-                            0,
-                        )?;
                     }
                 } else {
                     verifier.is_aligned::<UOffsetT>(vector_start)?;
@@ -371,7 +360,7 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
     mut table_verifier: TableVerifier<'a, 'b, 'c>,
     field: &Field,
     schema: &Schema,
-    verified: &mut VerifiedTables,
+    verified: &mut Verified,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
     let field_type = field.type_();
@@ -478,15 +467,7 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
                 let child_obj = get_object(schema, enum_type.index())?;
                 buf_loc_to_obj_idx.insert(union_pos, enum_type.index());
                 if child_obj.is_struct() {
-                    verify_struct(
-                        verifier,
-                        &child_obj,
-                        union_pos,
-                        schema,
-                        verified,
-                        buf_loc_to_obj_idx,
-                        0,
-                    )?
+                    verify_struct(verifier, &child_obj, union_pos, schema, verified)?
                 } else {
                     verify_table(
                         verifier,
@@ -566,7 +547,7 @@ fn verify_union<'a, 'b, 'c>(
     field: &Field,
     union_pos: usize,
     schema: &Schema,
-    verified: &mut VerifiedTables,
+    verified: &mut Verified,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
     let union_enum = get_enum(schema, field.type_().index())?;
@@ -590,8 +571,6 @@ fn verify_union<'a, 'b, 'c>(
                         union_pos,
                         schema,
                         verified,
-                        buf_loc_to_obj_idx,
-                        0,
                     )?
                 } else {
                     verify_table(
