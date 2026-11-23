@@ -121,7 +121,7 @@ fn verify_table(
             BaseType::Obj => {
                 if let Some(field_pos) = table_verifier.deref(field.offset())? {
                     let object_index = field.type_().index();
-                    let child_obj = schema.objects().get(object_index.try_into()?);
+                    let child_obj = get_object(schema, object_index)?;
                     if child_obj.is_struct() {
                         buf_loc_to_obj_idx.insert(field_pos, object_index);
                         verify_struct(
@@ -188,7 +188,7 @@ fn verify_struct(
     for field in &struct_object.fields() {
         if field.type_().base_type() == BaseType::Obj {
             let obj_idx = field.type_().index();
-            let child_obj = schema.objects().get(obj_idx.try_into()?);
+            let child_obj = get_object(schema, obj_idx)?;
             if child_obj.is_struct() {
                 let field_pos = struct_pos.saturating_add(field.offset().into());
                 buf_loc_to_obj_idx.insert(field_pos, obj_idx);
@@ -239,15 +239,18 @@ fn verify_vector<'a, 'b, 'c>(
                 let vector_len = verifier.get_uoffset(vector_pos)?;
                 let vector_start = vector_pos.saturating_add(SIZE_UOFFSET);
                 let child_obj_idx = field.type_().index();
-                let child_obj = schema.objects().get(child_obj_idx.try_into()?);
+                let child_obj = get_object(schema, child_obj_idx)?;
                 if child_obj.is_struct() {
-                    let vector_size = vector_len.saturating_mul(child_obj.bytesize().try_into()?);
+                    let struct_size: usize = child_obj.bytesize().try_into()?;
+                    let vector_size = vector_len.saturating_mul(struct_size.try_into()?);
                     verifier.range_in_buffer(vector_start, vector_size.try_into()?)?;
                     let vector_range = core::ops::Range {
                         start: vector_start,
                         end: vector_start.saturating_add(vector_size.try_into()?),
                     };
-                    for struct_pos in vector_range.step_by(child_obj.bytesize().try_into()?) {
+                    // A struct of size 0 holds no bytes to verify.
+                    let step = struct_size.max(1);
+                    for struct_pos in vector_range.step_by(step) {
                         buf_loc_to_obj_idx.insert(struct_pos, child_obj_idx);
                         verify_struct(
                             verifier,
@@ -305,7 +308,7 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
     debug_assert_eq!(field_type.base_type(), BaseType::Vector);
     debug_assert_eq!(field_type.element(), BaseType::Union);
     let child_enum_idx = field_type.index();
-    let child_enum = schema.enums().get(child_enum_idx.try_into()?);
+    let child_enum = get_enum(schema, child_enum_idx)?;
     debug_assert!(!child_enum.values().is_empty());
 
     // Assuming the schema is valid, the previous field must be the enum vector, which consists of
@@ -401,7 +404,7 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
         match enum_type.base_type() {
             BaseType::String => <&str>::run_verifier(verifier, union_pos)?,
             BaseType::Obj => {
-                let child_obj = schema.objects().get(enum_type.index().try_into()?);
+                let child_obj = get_object(schema, enum_type.index())?;
                 buf_loc_to_obj_idx.insert(union_pos, enum_type.index());
                 if child_obj.is_struct() {
                     verify_struct(verifier, &child_obj, union_pos, schema, buf_loc_to_obj_idx)?
@@ -424,6 +427,26 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
     Ok(table_verifier)
 }
 
+/// Returns the object at `index` in `schema`, or an error if there is none.
+fn get_object<'a>(schema: &Schema<'a>, index: i32) -> FlatbufferResult<Object<'a>> {
+    let objects = schema.objects();
+    usize::try_from(index)
+        .ok()
+        .filter(|&i| i < objects.len())
+        .map(|i| objects.get(i))
+        .ok_or(FlatbufferError::InvalidSchema)
+}
+
+/// Returns the enum at `index` in `schema`, or an error if there is none.
+fn get_enum<'a>(schema: &Schema<'a>, index: i32) -> FlatbufferResult<Enum<'a>> {
+    let enums = schema.enums();
+    usize::try_from(index)
+        .ok()
+        .filter(|&i| i < enums.len())
+        .map(|i| enums.get(i))
+        .ok_or(FlatbufferError::InvalidSchema)
+}
+
 /// Returns the type of the member of `union_enum` whose value is `tag`.
 fn union_member_type<'a>(union_enum: &Enum<'a>, tag: u8) -> FlatbufferResult<Type<'a>> {
     union_enum
@@ -443,12 +466,15 @@ fn verify_union<'a, 'b, 'c>(
     verified: &mut VerifiedTables,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
-    let union_enum = schema.enums().get(field.type_().index().try_into()?);
+    let union_enum = get_enum(schema, field.type_().index())?;
     if union_enum.values().is_empty() {
         return Err(FlatbufferError::InvalidUnionEnum);
     }
 
-    let enum_offset = field.offset() - u16::try_from(SIZE_VOFFSET)?;
+    let enum_offset = field
+        .offset()
+        .checked_sub(u16::try_from(SIZE_VOFFSET)?)
+        .ok_or(FlatbufferError::InvalidUnionEnum)?;
     if let Some(enum_pos) = table_verifier.deref(enum_offset)? {
         let enum_value = table_verifier.verifier().get_u8(enum_pos)?;
         let enum_type = union_member_type(&union_enum, enum_value)?;
@@ -456,7 +482,7 @@ fn verify_union<'a, 'b, 'c>(
         match enum_type.base_type() {
             BaseType::String => <&str>::run_verifier(table_verifier.verifier(), union_pos)?,
             BaseType::Obj => {
-                let child_obj = schema.objects().get(enum_type.index().try_into()?);
+                let child_obj = get_object(schema, enum_type.index())?;
                 buf_loc_to_obj_idx.insert(union_pos, enum_type.index());
                 if child_obj.is_struct() {
                     verify_struct(
@@ -722,5 +748,104 @@ mod tests {
             verify(&buffer(9), &schema),
             Err(FlatbufferError::InvalidUnionEnum)
         ));
+    }
+
+    /// A `Root` table with one offset field (to `20`) at vtable offset 4.
+    fn table_with_offset_field() -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[6, 8, 4])); // root vtable
+        buffer.extend([0, 0]); // padding
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend(4u32.to_le_bytes()); // offset field
+        buffer.extend(0u32.to_le_bytes()); // target: an empty vector
+        buffer
+    }
+
+    #[test]
+    fn test_table_field_with_invalid_object_index_is_rejected() {
+        let schema = build_schema(
+            &[TestObject::new_table(
+                "Root",
+                vec![field("a", BaseType::Obj, 7, 4)],
+            )],
+            &[],
+        );
+        assert!(matches!(
+            verify(&table_with_offset_field(), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn test_vector_field_with_invalid_object_index_is_rejected() {
+        let schema = build_schema(
+            &[TestObject::new_table(
+                "Root",
+                vec![vector_field("a", BaseType::Obj, 7, 4)],
+            )],
+            &[],
+        );
+        assert!(matches!(
+            verify(&table_with_offset_field(), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn test_union_field_with_invalid_enum_index_is_rejected() {
+        let schema = build_schema(
+            &[
+                TestObject::new_table("A", vec![field("x", BaseType::UInt, -1, 4)]),
+                TestObject::new_table(
+                    "Root",
+                    vec![
+                        field("u", BaseType::Union, 3, 6),
+                        field("u_type", BaseType::UType, 3, 4),
+                    ],
+                ),
+            ],
+            &[],
+        );
+        assert!(matches!(
+            verify(&single_union_buffer(1), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn test_union_field_without_room_for_its_type_field_is_rejected() {
+        // A union field's type field is in the vtable slot before it, so a union field in the
+        // first slot has none.
+        let schema = build_schema(
+            &[
+                TestObject::new_table("A", vec![field("x", BaseType::UInt, -1, 4)]),
+                TestObject::new_table("Root", vec![field("u", BaseType::Union, 0, 0)]),
+            ],
+            &[TestUnion {
+                name: "U",
+                members: vec![("NONE", BaseType::None, -1, 0), ("A", BaseType::Obj, 0, 1)],
+            }],
+        );
+        assert!(verify(&single_union_buffer(1), &schema).is_err());
+    }
+
+    #[test]
+    fn test_vector_of_empty_structs_is_accepted() {
+        let schema = build_schema(
+            &[
+                TestObject::new_table("Root", vec![vector_field("s", BaseType::Obj, 1, 4)]),
+                TestObject::new_struct("Z", 0, vec![]),
+            ],
+            &[],
+        );
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[6, 8, 4])); // root vtable
+        buffer.extend([0, 0]); // padding
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend(4u32.to_le_bytes()); // `s`
+        buffer.extend(3u32.to_le_bytes()); // `s` length
+        verify(&buffer, &schema).unwrap();
     }
 }
