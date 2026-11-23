@@ -23,6 +23,10 @@ use flatbuffers::{
 use std::collections::{HashMap, HashSet};
 
 /// Verifies a buffer against its schema with custom verification options.
+///
+/// Fills `buf_loc_to_obj_idx` with the index in `schema.objects()` of the table or struct at each
+/// position, or -1 for the root table. When a nested struct starts where its parent does, the
+/// parent's entry is kept.
 pub fn verify_with_options(
     buffer: &[u8],
     schema: &Schema,
@@ -79,7 +83,8 @@ fn get_enum<'a>(schema: &Schema<'a>, index: i32) -> FlatbufferResult<Enum<'a>> {
         .ok_or(FlatbufferError::InvalidSchema)
 }
 
-/// Returns the type of the union member that the type byte `enum_value` selects.
+/// Returns the type of the union member at index `enum_value`. This assumes each member's value is
+/// its index.
 fn get_union_member_type<'a>(union_enum: &Enum<'a>, enum_value: u8) -> FlatbufferResult<Type<'a>> {
     let values = union_enum.values();
     let index = usize::from(enum_value);
@@ -235,7 +240,11 @@ fn verify_struct(
         return Err(FlatbufferError::InvalidSchema);
     }
     let bytesize = struct_bytesize(struct_object)?;
-    verifier.range_in_buffer(struct_pos, bytesize)?;
+    // Nested structs lie inside the outermost one, so checking them again would only inflate the
+    // verifier's apparent size.
+    if depth == 0 {
+        verifier.range_in_buffer(struct_pos, bytesize)?;
+    }
 
     let mut fields_size = 0usize;
     for field in &struct_object.fields() {
@@ -244,6 +253,11 @@ fn verify_struct(
             BaseType::Array => (type_.element(), usize::from(type_.fixed_length())),
             base_type => (base_type, 1),
         };
+        // Rejecting zero-length arrays makes every field at least one byte, so a struct has at most
+        // `bytesize` fields to check.
+        if count == 0 {
+            return Err(FlatbufferError::InvalidSchema);
+        }
         let (element_size, child_obj) = if is_integer(element) || is_float(element) {
             (get_type_size(element), None)
         } else if element == BaseType::Obj {
@@ -277,7 +291,7 @@ fn verify_struct(
                 // Doesn't overflow, since the field ends inside the struct and the struct inside
                 // the buffer.
                 let child_pos = struct_pos + offset + i * element_size;
-                buf_loc_to_obj_idx.insert(child_pos, type_.index());
+                buf_loc_to_obj_idx.entry(child_pos).or_insert(type_.index());
                 verify_struct(
                     verifier,
                     &child_obj,
@@ -585,7 +599,7 @@ mod tests {
     use super::*;
     use crate::reflection_generated::reflection::root_as_schema;
     use crate::test_util::{
-        array_field, build_schema, field, vector_field, TestObject, STRING_UNION,
+        array_field, build_schema, field, vector_field, TestField, TestObject, STRING_UNION,
     };
 
     fn le_u16s(values: &[u16]) -> Vec<u8> {
@@ -601,6 +615,36 @@ mod tests {
             &mut HashMap::new(),
             Some("Root"),
         )
+    }
+
+    /// The `buf_loc_to_obj_idx` that verifying `buffer` records.
+    fn recorded_objects(buffer: &[u8], schema: &[u8]) -> HashMap<usize, i32> {
+        let schema = root_as_schema(schema).unwrap();
+        let mut buf_loc_to_obj_idx = HashMap::new();
+        verify_with_options(
+            buffer,
+            &schema,
+            &VerifierOptions::default(),
+            &mut buf_loc_to_obj_idx,
+            Some("Root"),
+        )
+        .unwrap();
+        buf_loc_to_obj_idx
+    }
+
+    /// The smallest `max_apparent_size` that `buffer` verifies with.
+    fn min_apparent_size(buffer: &[u8], schema: &[u8]) -> usize {
+        let schema = root_as_schema(schema).unwrap();
+        (0..1000)
+            .find(|&max_apparent_size| {
+                let opts = VerifierOptions {
+                    max_apparent_size,
+                    ..Default::default()
+                };
+                verify_with_options(buffer, &schema, &opts, &mut HashMap::new(), Some("Root"))
+                    .is_ok()
+            })
+            .unwrap()
     }
 
     /// A root table whose only field, at vtable offset 4 and buffer position 16, holds `field`.
@@ -667,24 +711,26 @@ mod tests {
         build_schema(&objects, &[])
     }
 
-    /// A table `Root { p: P }`, where 6-byte struct `P` holds `z: ubyte` at offset 0 and
-    /// `arr: [C:arr_len]` at offset 2, and struct `C` is a 2-byte `ushort`.
-    fn struct_array_schema(arr_len: u16) -> Vec<u8> {
+    /// A table `Root { p: P }`, where `P` is a 6-byte struct with `p_fields`, and struct `C` is a
+    /// 2-byte `ushort`.
+    fn struct_p_schema(p_fields: Vec<TestField>) -> Vec<u8> {
         build_schema(
             &[
                 TestObject::new_struct("C", 2, vec![field("x", BaseType::UShort, -1, 0)]),
-                TestObject::new_struct(
-                    "P",
-                    6,
-                    vec![
-                        array_field("arr", BaseType::Obj, 0, 2, arr_len),
-                        field("z", BaseType::UByte, -1, 0),
-                    ],
-                ),
+                TestObject::new_struct("P", 6, p_fields),
                 TestObject::new_table("Root", vec![field("p", BaseType::Obj, 1, 4)]),
             ],
             &[],
         )
+    }
+
+    /// A [struct_p_schema] where `P` holds `z: ubyte` at offset 0 and `arr: [C:arr_len]` at
+    /// offset 2.
+    fn struct_array_schema(arr_len: u16) -> Vec<u8> {
+        struct_p_schema(vec![
+            array_field("arr", BaseType::Obj, 0, 2, arr_len),
+            field("z", BaseType::UByte, -1, 0),
+        ])
     }
 
     #[test]
@@ -974,24 +1020,38 @@ mod tests {
 
     #[test]
     fn test_struct_array_elements_are_recorded() {
-        let schema_data = struct_array_schema(2);
-        let schema = root_as_schema(&schema_data).unwrap();
         let buffer = one_field_table(&[9, 0, 1, 0, 2, 0]); // `p`
 
-        let mut buf_loc_to_obj_idx = HashMap::new();
-        verify_with_options(
-            &buffer,
-            &schema,
-            &VerifierOptions::default(),
-            &mut buf_loc_to_obj_idx,
-            Some("Root"),
-        )
-        .unwrap();
-
         assert_eq!(
-            buf_loc_to_obj_idx,
+            recorded_objects(&buffer, &struct_array_schema(2)),
             HashMap::from([(12, -1), (16, 1), (18, 0), (20, 0)])
         );
+    }
+
+    #[test]
+    fn test_struct_keeps_its_entry_when_nested_struct_shares_its_position() {
+        let buffer = one_field_table(&[1, 0, 2, 0, 9, 0]); // `p`
+
+        for (kind, c_field, expected) in [
+            (
+                "struct",
+                field("c", BaseType::Obj, 0, 0),
+                HashMap::from([(12, -1), (16, 1)]),
+            ),
+            (
+                "struct array",
+                array_field("c", BaseType::Obj, 0, 0, 2),
+                HashMap::from([(12, -1), (16, 1), (18, 0)]),
+            ),
+        ] {
+            let schema = struct_p_schema(vec![c_field, field("z", BaseType::UByte, -1, 4)]);
+
+            assert_eq!(
+                recorded_objects(&buffer, &schema),
+                expected,
+                "{kind} at offset 0 of `P`"
+            );
+        }
     }
 
     #[test]
@@ -1002,5 +1062,56 @@ mod tests {
             verify(&one_field_table(&[9, 0, 1, 0, 2, 0]), &schema),
             Err(FlatbufferError::InvalidSchema)
         );
+    }
+
+    #[test]
+    fn test_struct_with_zero_length_array_is_rejected() {
+        let schema = build_schema(
+            &[
+                TestObject::new_table("Root", vec![field("s", BaseType::Obj, 1, 4)]),
+                TestObject::new_struct(
+                    "S",
+                    1,
+                    vec![
+                        array_field("arr", BaseType::UByte, -1, 0, 0),
+                        field("x", BaseType::UByte, -1, 0),
+                    ],
+                ),
+            ],
+            &[],
+        );
+
+        assert_eq!(
+            verify(&one_field_table(&[7]), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        );
+    }
+
+    #[test]
+    fn test_nested_structs_count_once_toward_apparent_size() {
+        // Each nested schema lays out the same bytes as its flat one.
+        for (kind, buffer, nested, flat) in [
+            (
+                "struct chain",
+                one_field_table(&[7]),
+                struct_chain_schema(65, &["a"]),
+                struct_chain_schema(1, &["a"]),
+            ),
+            (
+                "struct array",
+                one_field_table(&[9, 0, 1, 0, 2, 0]),
+                struct_array_schema(2),
+                struct_p_schema(vec![
+                    array_field("arr", BaseType::UShort, -1, 2, 2),
+                    field("z", BaseType::UByte, -1, 0),
+                ]),
+            ),
+        ] {
+            assert_eq!(
+                min_apparent_size(&buffer, &nested),
+                min_apparent_size(&buffer, &flat),
+                "{kind}"
+            );
+        }
     }
 }
