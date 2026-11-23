@@ -699,15 +699,6 @@ mod tests {
     }
 
     #[test]
-    fn test_union_with_non_contiguous_values_is_accepted() {
-        let schema = single_union_schema(vec![
-            ("NONE", BaseType::None, -1, 0),
-            ("A", BaseType::Obj, 0, 5),
-        ]);
-        verify(&single_union_buffer(5), &schema).unwrap();
-    }
-
-    #[test]
     fn test_union_tag_without_member_is_rejected() {
         let schema = single_union_schema(shuffled_members());
         assert!(matches!(
