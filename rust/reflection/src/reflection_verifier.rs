@@ -20,7 +20,7 @@ use flatbuffers::{
     ForwardsUOffset, InvalidFlatbuffer, TableVerifier, UOffsetT, Vector, Verifiable, Verifier,
     VerifierOptions, SIZE_UOFFSET, SIZE_VOFFSET,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Verifies a buffer against its schema with custom verification options.
 pub fn verify_with_options(
@@ -41,7 +41,7 @@ pub fn verify_with_options(
         if let Ok(table_pos) = verifier.get_uoffset(0) {
             // Inserts -1 as object index for root table
             buf_loc_to_obj_idx.insert(table_pos.try_into()?, -1);
-            let mut verified = vec![false; buffer.len()];
+            let mut verified = HashSet::new();
             return verify_table(
                 &mut verifier,
                 &table_object,
@@ -55,15 +55,19 @@ pub fn verify_with_options(
     Err(FlatbufferError::InvalidSchema)
 }
 
+/// Tables already verified, by buffer position and the location of their type in the schema.
+type VerifiedTables = HashSet<(usize, usize)>;
+
 fn verify_table(
     verifier: &mut Verifier,
     table_object: &Object,
     table_pos: usize,
     schema: &Schema,
-    verified: &mut [bool],
+    verified: &mut VerifiedTables,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<()> {
-    if table_pos < verified.len() && verified[table_pos] {
+    let key = (table_pos, table_object._tab.loc());
+    if verified.contains(&key) {
         return Ok(());
     }
 
@@ -169,7 +173,7 @@ fn verify_table(
     }
 
     table_verifier.finish();
-    verified[table_pos] = true;
+    verified.insert(key);
     Ok(())
 }
 
@@ -199,7 +203,7 @@ fn verify_vector<'a, 'b, 'c>(
     mut table_verifier: TableVerifier<'a, 'b, 'c>,
     field: &Field,
     schema: &Schema,
-    verified: &mut [bool],
+    verified: &mut VerifiedTables,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
     let field_name = field.name().to_owned();
@@ -293,7 +297,7 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
     mut table_verifier: TableVerifier<'a, 'b, 'c>,
     field: &Field,
     schema: &Schema,
-    verified: &mut [bool],
+    verified: &mut VerifiedTables,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
     let field_type = field.type_();
@@ -425,7 +429,6 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
                 return Err(FlatbufferError::UnsupportedUnionElementType(other));
             }
         }
-        verified[union_pos] = true;
     }
     Ok(table_verifier)
 }
@@ -435,7 +438,7 @@ fn verify_union<'a, 'b, 'c>(
     field: &Field,
     union_pos: usize,
     schema: &Schema,
-    verified: &mut [bool],
+    verified: &mut VerifiedTables,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
 ) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
     let union_enum = schema.enums().get(field.type_().index().try_into()?);
@@ -487,6 +490,240 @@ fn verify_union<'a, 'b, 'c>(
         )?;
     }
 
-    verified[union_pos] = true;
     Ok(table_verifier)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reflection_generated::reflection::{
+        Enum, EnumArgs, EnumVal, EnumValArgs, FieldArgs, ObjectArgs, SchemaArgs, Type, TypeArgs,
+    };
+    use flatbuffers::{FlatBufferBuilder, WIPOffset};
+
+    struct TestField {
+        name: &'static str,
+        base_type: BaseType,
+        index: i32,
+        offset: u16,
+    }
+
+    fn field(name: &'static str, base_type: BaseType, index: i32, offset: u16) -> TestField {
+        TestField {
+            name,
+            base_type,
+            index,
+            offset,
+        }
+    }
+
+    /// Builds a schema of tables with `objects` (sorted by name, fields sorted by name) and, if
+    /// `string_union` is set, a union enum `U` whose only member is a string.
+    fn build_schema(objects: &[(&str, Vec<TestField>)], string_union: bool) -> Vec<u8> {
+        let mut builder = FlatBufferBuilder::new();
+        let mut object_offsets = Vec::new();
+        for (name, fields) in objects {
+            let mut field_offsets = Vec::new();
+            for f in fields {
+                let field_name = builder.create_string(f.name);
+                let type_ = Type::create(
+                    &mut builder,
+                    &TypeArgs {
+                        base_type: f.base_type,
+                        index: f.index,
+                        ..Default::default()
+                    },
+                );
+                field_offsets.push(Field::create(
+                    &mut builder,
+                    &FieldArgs {
+                        name: Some(field_name),
+                        type_: Some(type_),
+                        offset: f.offset,
+                        ..Default::default()
+                    },
+                ));
+            }
+            let name = builder.create_string(name);
+            let fields = builder.create_vector(&field_offsets);
+            object_offsets.push(Object::create(
+                &mut builder,
+                &ObjectArgs {
+                    name: Some(name),
+                    fields: Some(fields),
+                    ..Default::default()
+                },
+            ));
+        }
+        let mut enum_offsets = Vec::new();
+        if string_union {
+            let mut values = Vec::new();
+            for (name, base_type, value) in [("NONE", BaseType::None, 0), ("Str", BaseType::String, 1)]
+            {
+                let name = builder.create_string(name);
+                let union_type = Type::create(
+                    &mut builder,
+                    &TypeArgs {
+                        base_type,
+                        ..Default::default()
+                    },
+                );
+                values.push(EnumVal::create(
+                    &mut builder,
+                    &EnumValArgs {
+                        name: Some(name),
+                        value,
+                        union_type: Some(union_type),
+                        ..Default::default()
+                    },
+                ));
+            }
+            let name = builder.create_string("U");
+            let values = builder.create_vector(&values);
+            let underlying_type = Type::create(
+                &mut builder,
+                &TypeArgs {
+                    base_type: BaseType::UType,
+                    ..Default::default()
+                },
+            );
+            enum_offsets.push(Enum::create(
+                &mut builder,
+                &EnumArgs {
+                    name: Some(name),
+                    values: Some(values),
+                    is_union: true,
+                    underlying_type: Some(underlying_type),
+                    ..Default::default()
+                },
+            ));
+        }
+        let objects = builder.create_vector(&object_offsets);
+        let enums = builder.create_vector::<WIPOffset<Enum>>(&enum_offsets);
+        let schema = Schema::create(
+            &mut builder,
+            &SchemaArgs {
+                objects: Some(objects),
+                enums: Some(enums),
+                ..Default::default()
+            },
+        );
+        builder.finish_minimal(schema);
+        builder.finished_data().to_vec()
+    }
+
+    fn le_u16s(values: &[u16]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn verify(buffer: &[u8], schema: &[u8]) -> FlatbufferResult<()> {
+        let schema = crate::reflection_generated::reflection::root_as_schema(schema).unwrap();
+        verify_with_options(
+            buffer,
+            &schema,
+            &VerifierOptions::default(),
+            &mut HashMap::new(),
+            Some("Root"),
+        )
+    }
+
+    #[test]
+    fn test_table_shared_by_fields_of_different_types_is_verified_as_each_type() {
+        let schema = build_schema(
+            &[
+                ("A", vec![field("x", BaseType::UByte, -1, 4)]),
+                (
+                    "B",
+                    vec![
+                        field("q", BaseType::ULong, -1, 4),
+                        field("y", BaseType::UByte, -1, 6),
+                    ],
+                ),
+                (
+                    "Root",
+                    vec![
+                        field("a", BaseType::Obj, 0, 4),
+                        field("b", BaseType::Obj, 1, 6),
+                    ],
+                ),
+            ],
+            false,
+        );
+
+        // `Root.a` and `Root.b` both point at one table, whose only data byte is the last byte of
+        // the buffer. It is a valid `A` but too short for `B.q`.
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[8, 12, 4, 8])); // root vtable
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend(16u32.to_le_bytes()); // `a`
+        buffer.extend(12u32.to_le_bytes()); // `b`
+        buffer.extend(le_u16s(&[8, 5, 4, 4])); // shared table vtable
+        buffer.extend(8i32.to_le_bytes()); // shared table to vtable
+        buffer.push(1);
+
+        assert!(verify(&buffer, &schema).is_err());
+    }
+
+    #[test]
+    fn test_table_at_union_string_position_is_verified() {
+        let schema = build_schema(
+            &[
+                ("B", vec![field("q", BaseType::ULong, -1, 4)]),
+                (
+                    "Root",
+                    vec![
+                        field("a", BaseType::Union, 0, 6),
+                        field("a_type", BaseType::UType, 0, 4),
+                        field("t", BaseType::Obj, 0, 8),
+                    ],
+                ),
+            ],
+            true,
+        );
+
+        // Union `Root.a` holds a string, and `Root.t` points at the same position, which is not a
+        // valid `B`.
+        let mut buffer = Vec::new();
+        buffer.extend(16u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[10, 16, 4, 8, 12])); // root vtable
+        buffer.extend([0, 0]); // padding
+        buffer.extend(12i32.to_le_bytes()); // root table to vtable
+        buffer.extend([1, 0, 0, 0]); // `a_type` and padding
+        buffer.extend(8u32.to_le_bytes()); // `a`
+        buffer.extend(4u32.to_le_bytes()); // `t`
+        buffer.extend(1u32.to_le_bytes()); // string length
+        buffer.extend(b"x\0");
+
+        assert!(verify(&buffer, &schema).is_err());
+    }
+
+    #[test]
+    fn test_table_shared_by_fields_of_same_type_is_accepted() {
+        let schema = build_schema(
+            &[
+                ("A", vec![field("x", BaseType::UByte, -1, 4)]),
+                (
+                    "Root",
+                    vec![
+                        field("a", BaseType::Obj, 0, 4),
+                        field("b", BaseType::Obj, 0, 6),
+                    ],
+                ),
+            ],
+            false,
+        );
+
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[8, 12, 4, 8])); // root vtable
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend(16u32.to_le_bytes()); // `a`
+        buffer.extend(12u32.to_le_bytes()); // `b`
+        buffer.extend(le_u16s(&[8, 5, 4, 4])); // shared table vtable
+        buffer.extend(8i32.to_le_bytes()); // shared table to vtable
+        buffer.push(1);
+
+        verify(&buffer, &schema).unwrap();
+    }
 }
