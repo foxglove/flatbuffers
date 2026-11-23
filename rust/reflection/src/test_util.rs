@@ -9,6 +9,7 @@ use flatbuffers::{FlatBufferBuilder, WIPOffset};
 pub struct TestField {
     name: &'static str,
     base_type: BaseType,
+    element: BaseType,
     index: i32,
     offset: u16,
 }
@@ -17,8 +18,39 @@ pub fn field(name: &'static str, base_type: BaseType, index: i32, offset: u16) -
     TestField {
         name,
         base_type,
+        element: BaseType::None,
         index,
         offset,
+    }
+}
+
+pub fn vector_field(name: &'static str, element: BaseType, index: i32, offset: u16) -> TestField {
+    TestField {
+        name,
+        base_type: BaseType::Vector,
+        element,
+        index,
+        offset,
+    }
+}
+
+/// A union enum. Each member is a name, a member type, an object index for table members, and a
+/// value. Members must be sorted by value and include `NONE = 0`.
+pub struct TestUnion {
+    pub name: &'static str,
+    pub members: Vec<(&'static str, BaseType, i32, i64)>,
+}
+
+impl TestUnion {
+    /// A union `U` whose only member, `Str = 1`, is a string.
+    pub fn string() -> Self {
+        Self {
+            name: "U",
+            members: vec![
+                ("NONE", BaseType::None, -1, 0),
+                ("Str", BaseType::String, -1, 1),
+            ],
+        }
     }
 }
 
@@ -49,10 +81,9 @@ impl TestObject {
     }
 }
 
-/// Builds a schema with `objects`, which must be sorted by name, with fields sorted by name. The
-/// object named `Root`, if any, is the root table. If `string_union` is set, the schema has a union
-/// enum `U` whose only member is a string.
-pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
+/// Builds a schema with `objects`, which must be sorted by name, with fields sorted by name, and
+/// `unions`, sorted by name. The object named `Root`, if any, is the root table.
+pub fn build_schema(objects: &[TestObject], unions: &[TestUnion]) -> Vec<u8> {
     let mut builder = FlatBufferBuilder::new();
     let mut object_offsets = Vec::new();
     let mut root_table = None;
@@ -64,6 +95,7 @@ pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
                 &mut builder,
                 &TypeArgs {
                     base_type: f.base_type,
+                    element: f.element,
                     index: f.index,
                     ..Default::default()
                 },
@@ -97,15 +129,15 @@ pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
         object_offsets.push(offset);
     }
     let mut enum_offsets = Vec::new();
-    if string_union {
+    for union in unions {
         let mut values = Vec::new();
-        for (name, base_type, value) in [("NONE", BaseType::None, 0), ("Str", BaseType::String, 1)]
-        {
+        for &(name, base_type, index, value) in &union.members {
             let name = builder.create_string(name);
             let union_type = Type::create(
                 &mut builder,
                 &TypeArgs {
                     base_type,
+                    index,
                     ..Default::default()
                 },
             );
@@ -119,7 +151,7 @@ pub fn build_schema(objects: &[TestObject], string_union: bool) -> Vec<u8> {
                 },
             ));
         }
-        let name = builder.create_string("U");
+        let name = builder.create_string(union.name);
         let values = builder.create_vector(&values);
         let underlying_type = Type::create(
             &mut builder,
