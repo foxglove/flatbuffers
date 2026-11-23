@@ -17,8 +17,8 @@
 use crate::reflection_generated::reflection::{BaseType, Enum, Field, Object, Schema, Type};
 use crate::{get_type_size, FlatbufferError, FlatbufferResult};
 use flatbuffers::{
-    ForwardsUOffset, InvalidFlatbuffer, TableVerifier, UOffsetT, Vector, Verifiable, Verifier,
-    VerifierOptions, SIZE_UOFFSET, SIZE_VOFFSET,
+    ForwardsUOffset, InvalidFlatbuffer, TableVerifier, UOffsetT, VOffsetT, Vector, Verifiable,
+    Verifier, VerifierOptions, SIZE_UOFFSET, SIZE_VOFFSET,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -165,7 +165,7 @@ fn verify_table(
                 } else if field.required() {
                     return InvalidFlatbuffer::new_missing_required(field.name().to_string())?;
                 } else {
-                    table_verifier
+                    verify_union_type_without_value(table_verifier, &field)?
                 }
             }
             other => {
@@ -537,6 +537,30 @@ fn union_member_type<'a>(union_enum: &Enum<'a>, tag: u8) -> FlatbufferResult<Typ
         .ok_or(FlatbufferError::InvalidUnionEnum)
 }
 
+/// The vtable offset of a single union field's type field, which precedes it.
+fn union_type_offset(field: &Field) -> FlatbufferResult<VOffsetT> {
+    field
+        .offset()
+        .checked_sub(u16::try_from(SIZE_VOFFSET)?)
+        .ok_or(FlatbufferError::InvalidUnionEnum)
+}
+
+/// Rejects a union whose value is absent but whose type is set to a member.
+fn verify_union_type_without_value<'a, 'b, 'c>(
+    mut table_verifier: TableVerifier<'a, 'b, 'c>,
+    field: &Field,
+) -> FlatbufferResult<TableVerifier<'a, 'b, 'c>> {
+    if let Some(enum_pos) = table_verifier.deref(union_type_offset(field)?)? {
+        if table_verifier.verifier().get_u8(enum_pos)? != 0 {
+            return InvalidFlatbuffer::new_inconsistent_union(
+                format!("{}_type", field.name()),
+                field.name().to_string(),
+            )?;
+        }
+    }
+    Ok(table_verifier)
+}
+
 fn verify_union<'a, 'b, 'c>(
     mut table_verifier: TableVerifier<'a, 'b, 'c>,
     field: &Field,
@@ -550,11 +574,7 @@ fn verify_union<'a, 'b, 'c>(
         return Err(FlatbufferError::InvalidUnionEnum);
     }
 
-    let enum_offset = field
-        .offset()
-        .checked_sub(u16::try_from(SIZE_VOFFSET)?)
-        .ok_or(FlatbufferError::InvalidUnionEnum)?;
-    if let Some(enum_pos) = table_verifier.deref(enum_offset)? {
+    if let Some(enum_pos) = table_verifier.deref(union_type_offset(field)?)? {
         let enum_value = table_verifier.verifier().get_u8(enum_pos)?;
         let enum_type = union_member_type(&union_enum, enum_value)?;
 
@@ -786,6 +806,29 @@ mod tests {
             verify(&single_union_buffer(9), &schema),
             Err(FlatbufferError::InvalidUnionEnum)
         ));
+    }
+
+    /// A `Root` whose union type is `tag` and whose union value is absent.
+    fn union_type_without_value_buffer(tag: u8) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[8, 8, 4, 0])); // root vtable
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend([tag, 0, 0, 0]); // `u_type` and padding
+        buffer
+    }
+
+    #[test]
+    fn test_union_type_without_value_is_rejected() {
+        let schema = single_union_schema(shuffled_members());
+        assert!(matches!(
+            verify(&union_type_without_value_buffer(9), &schema),
+            Err(FlatbufferError::VerificationError(
+                InvalidFlatbuffer::InconsistentUnion { .. }
+            ))
+        ));
+        assert!(verify(&union_type_without_value_buffer(3), &schema).is_err());
+        verify(&union_type_without_value_buffer(0), &schema).unwrap();
     }
 
     #[test]
