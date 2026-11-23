@@ -15,7 +15,7 @@
  */
 
 use crate::reflection_generated::reflection::{BaseType, Enum, Field, Object, Schema, Type};
-use crate::{FlatbufferError, FlatbufferResult};
+use crate::{get_type_size, FlatbufferError, FlatbufferResult};
 use flatbuffers::{
     ForwardsUOffset, InvalidFlatbuffer, TableVerifier, UOffsetT, Vector, Verifiable, Verifier,
     VerifierOptions, SIZE_UOFFSET, SIZE_VOFFSET,
@@ -129,7 +129,9 @@ fn verify_table(
                             &child_obj,
                             field_pos,
                             schema,
+                            verified,
                             buf_loc_to_obj_idx,
+                            0,
                         )?
                     } else {
                         let field_value = table_verifier.verifier().get_uoffset(field_pos)?;
@@ -177,25 +179,92 @@ fn verify_table(
     Ok(())
 }
 
+/// Maximum depth of structs nested in structs.
+const MAX_STRUCT_DEPTH: usize = 64;
+
 fn verify_struct(
     verifier: &mut Verifier,
     struct_object: &Object,
     struct_pos: usize,
     schema: &Schema,
+    verified: &mut VerifiedTables,
     buf_loc_to_obj_idx: &mut HashMap<usize, i32>,
+    depth: usize,
 ) -> FlatbufferResult<()> {
-    verifier.range_in_buffer(struct_pos, struct_object.bytesize().try_into()?)?;
+    if depth > MAX_STRUCT_DEPTH {
+        return Err(FlatbufferError::InvalidSchema);
+    }
+    let key = (struct_pos, struct_object._tab.loc());
+    if verified.contains(&key) {
+        return Ok(());
+    }
+    let bytesize: usize = struct_object.bytesize().try_into()?;
+    verifier.range_in_buffer(struct_pos, bytesize)?;
     for field in &struct_object.fields() {
-        if field.type_().base_type() == BaseType::Obj {
-            let obj_idx = field.type_().index();
-            let child_obj = get_object(schema, obj_idx)?;
-            if child_obj.is_struct() {
-                let field_pos = struct_pos.saturating_add(field.offset().into());
-                buf_loc_to_obj_idx.insert(field_pos, obj_idx);
-                verify_struct(verifier, &child_obj, field_pos, schema, buf_loc_to_obj_idx)?;
+        let type_ = field.type_();
+        // Returns the size of a struct field or array element of type `base_type`, and the
+        // struct it holds, if any.
+        let element = |base_type| -> FlatbufferResult<(usize, Option<(i32, Object)>)> {
+            match base_type {
+                BaseType::Bool
+                | BaseType::Byte
+                | BaseType::UByte
+                | BaseType::Short
+                | BaseType::UShort
+                | BaseType::Int
+                | BaseType::UInt
+                | BaseType::Long
+                | BaseType::ULong
+                | BaseType::Float
+                | BaseType::Double => Ok((get_type_size(base_type), None)),
+                BaseType::Obj => {
+                    let child_obj = get_object(schema, type_.index())?;
+                    if !child_obj.is_struct() {
+                        return Err(FlatbufferError::InvalidSchema);
+                    }
+                    let size = child_obj.bytesize().try_into()?;
+                    Ok((size, Some((type_.index(), child_obj))))
+                }
+                _ => Err(FlatbufferError::InvalidSchema),
             }
+        };
+        let (size, child) = match type_.base_type() {
+            BaseType::Array => {
+                let (element_size, child) = element(type_.element())?;
+                let size = element_size
+                    .checked_mul(type_.fixed_length().into())
+                    .ok_or(FlatbufferError::InvalidSchema)?;
+                // Array elements share their type's layout, so verifying the first element's
+                // nested structs verifies every element's.
+                let child = child.filter(|_| type_.fixed_length() > 0);
+                (size, child)
+            }
+            base_type => element(base_type)?,
+        };
+        let offset: usize = field.offset().into();
+        if offset
+            .checked_add(size)
+            .map_or(true, |field_end| field_end > bytesize)
+        {
+            return Err(FlatbufferError::InvalidSchema);
+        }
+        if let Some((obj_idx, child_obj)) = child {
+            let field_pos = struct_pos.saturating_add(offset);
+            if type_.base_type() == BaseType::Obj {
+                buf_loc_to_obj_idx.insert(field_pos, obj_idx);
+            }
+            verify_struct(
+                verifier,
+                &child_obj,
+                field_pos,
+                schema,
+                verified,
+                buf_loc_to_obj_idx,
+                depth + 1,
+            )?;
         }
     }
+    verified.insert(key);
     Ok(())
 }
 
@@ -257,7 +326,9 @@ fn verify_vector<'a, 'b, 'c>(
                             &child_obj,
                             struct_pos,
                             schema,
+                            verified,
                             buf_loc_to_obj_idx,
+                            0,
                         )?;
                     }
                 } else {
@@ -407,7 +478,15 @@ fn verify_vector_of_unions<'a, 'b, 'c>(
                 let child_obj = get_object(schema, enum_type.index())?;
                 buf_loc_to_obj_idx.insert(union_pos, enum_type.index());
                 if child_obj.is_struct() {
-                    verify_struct(verifier, &child_obj, union_pos, schema, buf_loc_to_obj_idx)?
+                    verify_struct(
+                        verifier,
+                        &child_obj,
+                        union_pos,
+                        schema,
+                        verified,
+                        buf_loc_to_obj_idx,
+                        0,
+                    )?
                 } else {
                     verify_table(
                         verifier,
@@ -490,7 +569,9 @@ fn verify_union<'a, 'b, 'c>(
                         &child_obj,
                         union_pos,
                         schema,
+                        verified,
                         buf_loc_to_obj_idx,
+                        0,
                     )?
                 } else {
                     verify_table(
@@ -838,5 +919,114 @@ mod tests {
         buffer.extend(4u32.to_le_bytes()); // `s`
         buffer.extend(3u32.to_le_bytes()); // `s` length
         verify(&buffer, &schema).unwrap();
+    }
+
+    /// A table `Root { s: S }` holding `struct_bytes` inline.
+    fn struct_table_buffer(struct_bytes: &[u8]) -> Vec<u8> {
+        let table_size = 4 + u16::try_from(struct_bytes.len()).unwrap();
+        let mut buffer = Vec::new();
+        buffer.extend(12u32.to_le_bytes()); // root table offset
+        buffer.extend(le_u16s(&[6, table_size, 4])); // root vtable
+        buffer.extend([0, 0]); // padding
+        buffer.extend(8i32.to_le_bytes()); // root table to vtable
+        buffer.extend(struct_bytes);
+        buffer
+    }
+
+    /// Builds a schema with a table `Root { s: <first struct> }` as object 0, then `structs`, whose
+    /// names must sort after `Root` and in order, as objects 1 onwards.
+    fn struct_schema(structs: Vec<TestObject>) -> Vec<u8> {
+        let mut objects = vec![TestObject::new_table(
+            "Root",
+            vec![field("s", BaseType::Obj, 1, 4)],
+        )];
+        objects.extend(structs);
+        build_schema(&objects, &[])
+    }
+
+    #[test]
+    fn test_struct_with_non_inline_field_is_rejected() {
+        for base_type in [BaseType::String, BaseType::Vector, BaseType::Union] {
+            let schema = struct_schema(vec![TestObject::new_struct(
+                "S",
+                4,
+                vec![field("x", base_type, -1, 0)],
+            )]);
+            assert!(
+                matches!(
+                    verify(&struct_table_buffer(&[0; 4]), &schema),
+                    Err(FlatbufferError::InvalidSchema)
+                ),
+                "{base_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_struct_field_past_bytesize_is_rejected() {
+        let schema = struct_schema(vec![TestObject::new_struct(
+            "S",
+            1,
+            vec![field("x", BaseType::ULong, -1, 0)],
+        )]);
+        assert!(matches!(
+            verify(&struct_table_buffer(&[0; 1]), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn test_struct_that_contains_itself_is_rejected() {
+        let schema = struct_schema(vec![TestObject::new_struct(
+            "S",
+            4,
+            vec![
+                field("s", BaseType::Obj, 1, 0),
+                field("x", BaseType::UInt, -1, 0),
+            ],
+        )]);
+        assert!(matches!(
+            verify(&struct_table_buffer(&[0; 4]), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    /// Structs `S000`, `S001`, ..., each holding the next `fields_per_struct` times at offset 0,
+    /// `depth` structs in all. The last holds a `ubyte`.
+    fn nested_structs(depth: usize, fields_per_struct: usize) -> Vec<TestObject> {
+        const NAMES: [&str; 4] = ["a", "b", "c", "d"];
+        (0..depth)
+            .map(|i| {
+                let name: &'static str = Box::leak(format!("S{i:03}").into_boxed_str());
+                let fields = if i + 1 < depth {
+                    NAMES[..fields_per_struct]
+                        .iter()
+                        .map(|&f| field(f, BaseType::Obj, i as i32 + 2, 0))
+                        .collect()
+                } else {
+                    vec![field("x", BaseType::UByte, -1, 0)]
+                };
+                TestObject::new_struct(name, 1, fields)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_struct_nesting_depth_limit() {
+        let schema = struct_schema(nested_structs(MAX_STRUCT_DEPTH + 1, 1));
+        verify(&struct_table_buffer(&[0]), &schema).unwrap();
+
+        let schema = struct_schema(nested_structs(MAX_STRUCT_DEPTH + 2, 1));
+        assert!(matches!(
+            verify(&struct_table_buffer(&[0]), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn test_struct_with_overlapping_struct_fields_verifies_each_once() {
+        // Without memoization, this would take 4^64 calls.
+        let schema = struct_schema(nested_structs(MAX_STRUCT_DEPTH, 4));
+        verify(&struct_table_buffer(&[0]), &schema).unwrap();
     }
 }

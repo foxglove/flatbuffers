@@ -23,13 +23,14 @@ use crate::{
     get_any_field_integer_in_struct, get_any_field_string, get_any_field_string_in_struct,
     get_any_root, get_field_float, get_field_integer, get_field_string, get_field_struct,
     get_field_struct_in_struct, get_field_table, get_field_vector, get_type_size, FlatbufferError,
-    FlatbufferResult,
+    FlatbufferResult, ForwardsUOffset,
 };
 use flatbuffers::{Follow, Table, Vector, VerifierOptions};
 use num_traits::float::Float;
 use num_traits::int::PrimInt;
 use num_traits::FromPrimitive;
 use std::collections::HashMap;
+use std::mem::size_of;
 
 #[derive(Debug)]
 pub struct SafeBuffer<'a> {
@@ -70,28 +71,91 @@ impl<'a> SafeBuffer<'a> {
         }
     }
 
+    /// Returns the object at `index` in the schema, if there is one.
+    fn object(&self, index: i32) -> Option<Object<'a>> {
+        usize::try_from(index)
+            .ok()
+            .filter(|&i| i < self.schema.objects().len())
+            .map(|i| self.schema.objects().get(i))
+    }
+
     /// Returns the struct type that `field` holds, or an error if it does not hold a struct.
     fn struct_type(&self, field: &Field) -> FlatbufferResult<Object<'a>> {
         let type_ = field.type_();
         if type_.base_type() == BaseType::Obj {
-            if let Some(obj) = usize::try_from(type_.index())
-                .ok()
-                .filter(|&i| i < self.schema.objects().len())
-                .map(|i| self.schema.objects().get(i))
-            {
+            if let Some(obj) = self.object(type_.index()) {
                 if obj.is_struct() {
                     return Ok(obj);
                 }
             }
         }
-        Err(FlatbufferError::FieldTypeMismatch(
-            "Struct".to_string(),
-            type_
-                .base_type()
-                .variant_name()
-                .unwrap_or_default()
-                .to_string(),
-        ))
+        Err(type_mismatch("Struct", field))
+    }
+}
+
+fn type_mismatch(expected: &str, field: &Field) -> FlatbufferError {
+    FlatbufferError::FieldTypeMismatch(
+        expected.to_string(),
+        field
+            .type_()
+            .base_type()
+            .variant_name()
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+/// Returns a type mismatch error naming `T` unless `matches`.
+fn check_field_type<T>(field: &Field, matches: bool) -> FlatbufferResult<()> {
+    if matches {
+        Ok(())
+    } else {
+        Err(type_mismatch(std::any::type_name::<T>(), field))
+    }
+}
+
+/// A type that [SafeTable::get_field_vector] can read vector elements as.
+pub trait SafeVectorElement<'a>: Follow<'a> {
+    /// Whether this type reads vector elements of type `element`. `obj` is the element's object
+    /// when `element` is [BaseType::Obj].
+    fn reads(element: BaseType, obj: Option<&Object>) -> bool;
+}
+
+macro_rules! impl_safe_vector_scalar {
+    ($($type:ty => $($base_type:ident)|+),+ $(,)?) => {
+        $(
+            impl<'a> SafeVectorElement<'a> for $type {
+                fn reads(element: BaseType, _obj: Option<&Object>) -> bool {
+                    matches!(element, $(BaseType::$base_type)|+)
+                }
+            }
+        )+
+    };
+}
+
+impl_safe_vector_scalar!(
+    bool => Bool,
+    i8 => Byte,
+    u8 => UByte | UType,
+    i16 => Short,
+    u16 => UShort,
+    i32 => Int,
+    u32 => UInt,
+    i64 => Long,
+    u64 => ULong,
+    f32 => Float,
+    f64 => Double,
+);
+
+impl<'a> SafeVectorElement<'a> for ForwardsUOffset<&'a str> {
+    fn reads(element: BaseType, _obj: Option<&Object>) -> bool {
+        element == BaseType::String
+    }
+}
+
+impl<'a> SafeVectorElement<'a> for ForwardsUOffset<Table<'a>> {
+    fn reads(element: BaseType, obj: Option<&Object>) -> bool {
+        element == BaseType::Obj && obj.is_some_and(|obj| !obj.is_struct())
     }
 }
 
@@ -118,7 +182,26 @@ impl<'a> SafeTable<'a> {
         field_name: &str,
     ) -> FlatbufferResult<Option<T>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
-            // SAFETY: the buffer was verified during construction.
+            let base_type = field.type_().base_type();
+            let is_integer = matches!(
+                base_type,
+                BaseType::Bool
+                    | BaseType::Byte
+                    | BaseType::UByte
+                    | BaseType::UType
+                    | BaseType::Short
+                    | BaseType::UShort
+                    | BaseType::Int
+                    | BaseType::UInt
+                    | BaseType::Long
+                    | BaseType::ULong
+            );
+            check_field_type::<T>(
+                &field,
+                is_integer && size_of::<T>() == get_type_size(base_type),
+            )?;
+            // SAFETY: the buffer was verified during construction, and the field is an integer
+            // of `T`'s size.
             Ok(
                 unsafe {
                     get_field_integer::<T>(&Table::new(&self.safe_buf.buf, self.loc), &field)
@@ -137,7 +220,14 @@ impl<'a> SafeTable<'a> {
         field_name: &str,
     ) -> FlatbufferResult<Option<T>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
-            // SAFETY: the buffer was verified during construction.
+            let base_type = field.type_().base_type();
+            let is_float = matches!(base_type, BaseType::Float | BaseType::Double);
+            check_field_type::<T>(
+                &field,
+                is_float && size_of::<T>() == get_type_size(base_type),
+            )?;
+            // SAFETY: the buffer was verified during construction, and the field is a float of
+            // `T`'s size.
             Ok(unsafe { get_field_float::<T>(&Table::new(&self.safe_buf.buf, self.loc), &field) })
         } else {
             Err(FlatbufferError::FieldNotFound)
@@ -149,7 +239,10 @@ impl<'a> SafeTable<'a> {
     /// the [field_name] doesn't match the table.
     pub fn get_field_string(&self, field_name: &str) -> FlatbufferResult<Option<&str>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
-            // SAFETY: the buffer was verified during construction.
+            if field.type_().base_type() != BaseType::String {
+                return Err(type_mismatch("String", &field));
+            }
+            // SAFETY: the buffer was verified during construction, and the field is a string.
             Ok(Some(unsafe {
                 get_field_string(&Table::new(&self.safe_buf.buf, self.loc), &field)
             }))
@@ -181,25 +274,30 @@ impl<'a> SafeTable<'a> {
     /// the table doesn't match the buffer or
     /// the [field_name] doesn't match the table or
     /// the field type doesn't match.
-    pub fn get_field_vector<T: Follow<'a>>(
+    pub fn get_field_vector<T: SafeVectorElement<'a>>(
         &self,
         field_name: &str,
     ) -> FlatbufferResult<Vector<'a, T>> {
         if let Some(field) = find_field_by_name(&self.obj, field_name) {
-            if field.type_().base_type() != BaseType::Vector
-                || core::mem::size_of::<T>() != get_type_size(field.type_().element())
-            {
+            let type_ = field.type_();
+            if type_.base_type() != BaseType::Vector {
+                return Err(type_mismatch("Vector", &field));
+            }
+            let element_obj = (type_.element() == BaseType::Obj)
+                .then(|| self.safe_buf.object(type_.index()))
+                .flatten();
+            if !T::reads(type_.element(), element_obj.as_ref()) {
                 return Err(FlatbufferError::FieldTypeMismatch(
-                    "Vector".to_string(),
-                    field
-                        .type_()
-                        .base_type()
+                    std::any::type_name::<T>().to_string(),
+                    type_
+                        .element()
                         .variant_name()
                         .unwrap_or_default()
                         .to_string(),
                 ));
             }
-            // SAFETY: the buffer was verified during construction.
+            // SAFETY: the buffer was verified during construction, and `T` reads the vector's
+            // elements.
             Ok(unsafe { get_field_vector(&Table::new(&self.safe_buf.buf, self.loc), &field) })
         } else {
             Err(FlatbufferError::FieldNotFound)
@@ -369,7 +467,7 @@ impl<'a> SafeStruct<'a> {
 mod tests {
     use super::*;
     use crate::reflection_generated::reflection::root_as_schema;
-    use crate::test_util::{build_schema, field, TestObject};
+    use crate::test_util::{build_schema, field, vector_field, TestObject};
 
     /// A table `Root { p: P }`, where struct `P { c: C, z: ubyte }` holds struct `C { x: uint }`
     /// at offset 0, so `P` and `C` start at the same position.
@@ -438,5 +536,97 @@ mod tests {
             p.get_field_struct("z"),
             Err(FlatbufferError::FieldTypeMismatch(..))
         ));
+    }
+
+    /// A table `Root { f: float; h: short; name: string; v: [uint] }` with `f = 1.5`, `h = -3`,
+    /// `name = "hi"` and `v = [7, 8]`.
+    fn typed_fields() -> (Vec<u8>, Vec<u8>) {
+        let schema = build_schema(
+            &[TestObject::new_table(
+                "Root",
+                vec![
+                    field("f", BaseType::Float, -1, 4),
+                    field("h", BaseType::Short, -1, 6),
+                    field("name", BaseType::String, -1, 8),
+                    vector_field("v", BaseType::UInt, -1, 10),
+                ],
+            )],
+            &[],
+        );
+        let mut buffer = Vec::new();
+        buffer.extend(16u32.to_le_bytes()); // root table offset
+        for x in [12u16, 20, 4, 8, 12, 16] {
+            buffer.extend(x.to_le_bytes()); // root vtable
+        }
+        buffer.extend(12i32.to_le_bytes()); // root table to vtable
+        buffer.extend(1.5f32.to_le_bytes()); // `f`
+        buffer.extend((-3i16).to_le_bytes()); // `h`
+        buffer.extend([0, 0]); // padding
+        buffer.extend(8u32.to_le_bytes()); // `name`
+        buffer.extend(12u32.to_le_bytes()); // `v`
+        buffer.extend(2u32.to_le_bytes()); // `name` length
+        buffer.extend(b"hi\0\0"); // `name` and padding
+        buffer.extend(2u32.to_le_bytes()); // `v` length
+        buffer.extend(7u32.to_le_bytes());
+        buffer.extend(8u32.to_le_bytes());
+        (schema, buffer)
+    }
+
+    fn mismatch(expected: &str, actual: &str) -> FlatbufferError {
+        FlatbufferError::FieldTypeMismatch(expected.to_string(), actual.to_string())
+    }
+
+    #[test]
+    fn test_scalar_getters_check_field_type() {
+        let (schema_data, buffer) = typed_fields();
+        let schema = root_as_schema(&schema_data).unwrap();
+        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
+        let root = safe_buffer.get_root();
+
+        assert_eq!(root.get_field_float::<f32>("f"), Ok(Some(1.5)));
+        assert_eq!(
+            root.get_field_float::<f64>("f"),
+            Err(mismatch("f64", "Float"))
+        );
+        assert_eq!(
+            root.get_field_float::<f32>("h"),
+            Err(mismatch("f32", "Short"))
+        );
+
+        assert_eq!(root.get_field_integer::<i16>("h"), Ok(Some(-3)));
+        assert_eq!(
+            root.get_field_integer::<i64>("h"),
+            Err(mismatch("i64", "Short"))
+        );
+        assert_eq!(
+            root.get_field_integer::<i32>("f"),
+            Err(mismatch("i32", "Float"))
+        );
+
+        assert_eq!(root.get_field_string("name"), Ok(Some("hi")));
+        assert_eq!(root.get_field_string("f"), Err(mismatch("String", "Float")));
+    }
+
+    #[test]
+    fn test_get_field_vector_checks_element_type() {
+        let (schema_data, buffer) = typed_fields();
+        let schema = root_as_schema(&schema_data).unwrap();
+        let safe_buffer = SafeBuffer::new(&buffer, &schema).unwrap();
+        let root = safe_buffer.get_root();
+
+        let v = root.get_field_vector::<u32>("v").unwrap();
+        assert_eq!(v.iter().collect::<Vec<_>>(), [7, 8]);
+        assert!(matches!(
+            root.get_field_vector::<ForwardsUOffset<&str>>("v"),
+            Err(FlatbufferError::FieldTypeMismatch(_, element)) if element == "UInt"
+        ));
+        assert!(matches!(
+            root.get_field_vector::<f32>("v"),
+            Err(FlatbufferError::FieldTypeMismatch(_, element)) if element == "UInt"
+        ));
+        assert_eq!(
+            root.get_field_vector::<u32>("name").err(),
+            Some(mismatch("Vector", "String"))
+        );
     }
 }
