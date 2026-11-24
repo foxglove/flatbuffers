@@ -59,8 +59,9 @@ pub fn verify_with_options(
 struct Verified {
     /// Tables already verified, by buffer position and the location of their type in the schema.
     tables: HashSet<(usize, usize)>,
-    /// Structs whose layout has been verified, by the location of their type in the schema.
-    struct_layouts: HashSet<usize>,
+    /// Structs whose layout has been verified, by the location of their type in the schema, with
+    /// the number of struct levels nested in them.
+    struct_layouts: HashMap<usize, usize>,
 }
 
 fn verify_table(
@@ -198,21 +199,28 @@ fn verify_struct(
 }
 
 /// Checks that each of the struct's fields is a scalar, a struct, or a fixed array of either, and
-/// ends within the struct. Nested structs are inline, so a struct whose layout passes is in the
-/// buffer whenever its `bytesize` bytes are.
+/// ends within the struct, and that the struct, found at nesting depth `depth`, nests at most
+/// [MAX_STRUCT_DEPTH] levels deep. Nested structs are inline, so a struct whose layout passes is
+/// in the buffer whenever its `bytesize` bytes are. Returns the number of struct levels nested in
+/// the struct.
 fn verify_struct_layout(
     struct_object: &Object,
     schema: &Schema,
     verified: &mut Verified,
     depth: usize,
-) -> FlatbufferResult<()> {
+) -> FlatbufferResult<usize> {
     let key = struct_object._tab.loc();
-    if verified.struct_layouts.contains(&key) {
-        return Ok(());
+    if let Some(&height) = verified.struct_layouts.get(&key) {
+        return if depth + height > MAX_STRUCT_DEPTH {
+            Err(FlatbufferError::InvalidSchema)
+        } else {
+            Ok(height)
+        };
     }
     if depth > MAX_STRUCT_DEPTH {
         return Err(FlatbufferError::InvalidSchema);
     }
+    let mut height = 0;
     let bytesize: usize = struct_object.bytesize().try_into()?;
     for field in &struct_object.fields() {
         let type_ = field.type_();
@@ -258,11 +266,12 @@ fn verify_struct_layout(
             return Err(FlatbufferError::InvalidSchema);
         }
         if let Some(child_obj) = child {
-            verify_struct_layout(&child_obj, schema, verified, depth + 1)?;
+            let child_height = verify_struct_layout(&child_obj, schema, verified, depth + 1)?;
+            height = height.max(child_height + 1);
         }
     }
-    verified.struct_layouts.insert(key);
-    Ok(())
+    verified.struct_layouts.insert(key, height);
+    Ok(height)
 }
 
 fn verify_vector<'a, 'b, 'c>(
@@ -1039,6 +1048,30 @@ mod tests {
         verify(&struct_table_buffer(&[0]), &schema).unwrap();
 
         let schema = struct_schema(nested_structs(MAX_STRUCT_DEPTH + 2, 1));
+        assert!(matches!(
+            verify(&struct_table_buffer(&[0]), &schema),
+            Err(FlatbufferError::InvalidSchema)
+        ));
+    }
+
+    #[test]
+    fn test_struct_nesting_depth_limit_applies_to_structs_checked_before() {
+        // `T { a: S050; b: S000 }`, where `S000` to `S099` each hold the next. Checking `a` first
+        // verifies `S050` near the top, but through `b` it is 51 levels down.
+        let mut objects = vec![TestObject::new_table(
+            "Root",
+            vec![field("s", BaseType::Obj, 101, 4)],
+        )];
+        objects.extend(nested_structs(100, 1));
+        objects.push(TestObject::new_struct(
+            "T",
+            1,
+            vec![
+                field("a", BaseType::Obj, 51, 0),
+                field("b", BaseType::Obj, 1, 0),
+            ],
+        ));
+        let schema = build_schema(&objects, &[]);
         assert!(matches!(
             verify(&struct_table_buffer(&[0]), &schema),
             Err(FlatbufferError::InvalidSchema)
