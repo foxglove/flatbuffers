@@ -25,7 +25,7 @@ mod test_util;
 pub use crate::r#struct::Struct;
 pub use crate::reflection_generated::reflection;
 pub use crate::reflection_verifier::verify_with_options;
-pub use crate::safe_buffer::SafeBuffer;
+pub use crate::safe_buffer::{SafeBuffer, SafeVectorElement};
 
 use flatbuffers::{
     emplace_scalar, read_scalar, EndianScalar, Follow, ForwardsUOffset, InvalidFlatbuffer,
